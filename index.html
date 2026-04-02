@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Last Zone Royale 3D</title>
+    <meta
+      name="description"
+      content="Arena shooter online em Three.js com ate 10 jogadores, habilidades completas, respawn e controles mobile."
+    >
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;500;600;700;800&family=Rajdhani:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    >
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <div class="page-glow page-glow--left"></div>
+    <div class="page-glow page-glow--right"></div>
+
+    <main class="app-shell">
+      <section class="panel panel--lobby">
+        <div class="brand-block">
+          <p class="eyebrow">SAKAWARMOTO // 3D Online Arena</p>
+          <h1>Last Zone Royale 3D</h1>
+          <p class="lede">
+            Arena shooter em Three.js com salas online, 4 classes de arma, 12 habilidades,
+            morte, respawn automatico, placar ao vivo e suporte completo para desktop e mobile.
+          </p>
+        </div>
+
+        <div class="notice" id="networkNotice"></div>
+
+        <label class="field">
+          <span class="field__label">Nome do piloto</span>
+          <input id="playerName" type="text" maxlength="18" placeholder="Seu codinome">
+        </label>
+
+        <div class="field">
+          <div class="field__label-row">
+            <span class="field__label">Classe de arma</span>
+            <span class="field__tag" id="selectedWeaponBadge">Tempest Rifle</span>
+          </div>
+          <div class="weapon-grid" id="weaponGrid"></div>
+        </div>
+
+        <div class="field">
+          <div class="field__label-row">
+            <span class="field__label">Codigo da sala</span>
+            <button id="copyRoomButton" class="small-button" type="button">Copiar</button>
+          </div>
+          <div class="room-actions">
+            <input id="roomCodeInput" type="text" maxlength="8" placeholder="ABCDE">
+            <button id="createRoomButton" class="button button--primary" type="button">
+              Criar Sala
+            </button>
+            <button id="joinRoomButton" class="button button--secondary" type="button">
+              Entrar
+            </button>
+          </div>
+        </div>
+
+        <div class="button-stack">
+          <button id="practiceButton" class="button button--secondary" type="button">
+            Abrir Previa Offline
+          </button>
+          <button id="leaveRoomButton" class="button button--ghost" type="button">
+            Sair da Sala
+          </button>
+          <button id="startMatchButton" class="button button--primary" type="button">
+            Iniciar Partida
+          </button>
+        </div>
+
+        <article class="detail-card" id="weaponDetail"></article>
+
+        <section class="subpanel">
+          <div class="subpanel__header">
+            <h2>Sala Atual</h2>
+            <span class="field__tag" id="roomSummary">Nenhuma sala</span>
+          </div>
+          <div class="player-list" id="playerList"></div>
+        </section>
+
+        <section class="subpanel">
+          <div class="subpanel__header">
+            <h2>Controles</h2>
+            <span class="field__tag">Desktop + Mobile</span>
+          </div>
+          <div class="controls-copy">
+            <p><strong>Desktop:</strong> WASD move, mouse mira, clique esquerdo dispara e Q/E/R ativam habilidades.</p>
+            <p><strong>Mobile:</strong> analogico esquerdo move, analogico direito mira, botao FIRE atira e Q/E/R usam habilidades.</p>
+            <p><strong>Enter:</strong> recentra a camera no desktop.</p>
+          </div>
+        </section>
+      </section>
+
+      <section class="panel panel--arena">
+        <div class="arena-topbar">
+          <span class="state-pill" id="matchStateLabel">Lobby</span>
+          <span class="arena-readout" id="syncReadout">Sincronizacao local</span>
+          <span class="arena-readout" id="winnerReadout">Sem vencedor</span>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="gameCanvas" width="1280" height="720"></canvas>
+
+          <div class="rotate-overlay" id="rotateOverlay">
+            <p>Vire o celular para jogar em paisagem</p>
+            <strong>Modo paisagem</strong>
+          </div>
+
+          <div class="respawn-overlay" id="respawnOverlay" hidden>
+            <p id="respawnLabel">Aguardando partida</p>
+            <strong id="respawnTimer">00:00</strong>
+          </div>
+
+          <div class="hud-layer">
+            <div class="hud-panel hud-panel--left">
+              <div class="meter-card">
+                <span>Vida</span>
+                <strong id="healthLabel">100 / 100</strong>
+                <div class="meter">
+                  <div class="meter__fill meter__fill--health" id="healthBar"></div>
+                </div>
+              </div>
+              <div class="meter-card">
+                <span>Escudo</span>
+                <strong id="shieldLabel">40 / 40</strong>
+                <div class="meter">
+                  <div class="meter__fill meter__fill--shield" id="shieldBar"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="hud-panel hud-panel--right">
+              <div class="feed-card">
+                <span>Kill Feed</span>
+                <div id="killFeed" class="feed-list"></div>
+              </div>
+              <div class="feed-card">
+                <span>Placar</span>
+                <div id="scoreboard" class="scoreboard-list"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mobile-controls" id="mobileControls">
+            <div class="mobile-stick-zone" id="movePad">
+              <div class="mobile-stick-knob" id="moveStick"></div>
+            </div>
+
+            <div class="mobile-right-stack">
+              <div class="mobile-stick-zone mobile-stick-zone--aim" id="aimPad">
+                <div class="mobile-stick-knob" id="aimStick"></div>
+              </div>
+
+              <div class="mobile-action-cluster">
+                <button class="mobile-action mobile-action--fire" id="mobileFireButton" type="button">
+                  FIRE
+                </button>
+                <button class="mobile-action" id="mobileAbilityQ" type="button">
+                  <span data-mobile-label>Q</span>
+                  <small data-mobile-meta>Q</small>
+                </button>
+                <button class="mobile-action" id="mobileAbilityE" type="button">
+                  <span data-mobile-label>E</span>
+                  <small data-mobile-meta>E</small>
+                </button>
+                <button class="mobile-action" id="mobileAbilityR" type="button">
+                  <span data-mobile-label>R</span>
+                  <small data-mobile-meta>R</small>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ability-bar" id="abilityBar"></div>
+
+        <div class="status-grid">
+          <article class="status-card">
+            <span>Tempestade</span>
+            <strong id="stormReadout">Aguardando partida</strong>
+            <small id="stormTimer">00:00</small>
+          </article>
+          <article class="status-card">
+            <span>Jogadores vivos</span>
+            <strong id="aliveReadout">0</strong>
+            <small id="roomCodeReadout">Sala: ----</small>
+          </article>
+          <article class="status-card">
+            <span>Abates</span>
+            <strong id="killsReadout">0</strong>
+            <small id="loadoutReadout">Classe: --</small>
+          </article>
+          <article class="status-card">
+            <span>Estatisticas</span>
+            <strong>Combate</strong>
+            <small id="statsReadout">K/D/R 0 / 0 / 0</small>
+          </article>
+        </div>
+
+        <p class="footer-note">
+          O front-end continua estatico e o online segue via Playroom. Basta preencher
+          <code>playroom.config.js</code> com o <code>gameId</code> para abrir salas online.
+        </p>
+      </section>
+    </main>
+
+    <script src="./playroom.config.js"></script>
+    <script src="https://unpkg.com/playroomkit/multiplayer.full.umd.js" crossorigin="anonymous"></script>
+    <script type="module" src="./script.js"></script>
+  </body>
+</html>
