@@ -103,7 +103,7 @@ export class BattleRoyaleGame {
       networkMode: "missing",
     };
 
-    this.playerName = "Piloto";
+    this.playerName = "Player";
     this.selectedLoadoutId = LOADOUTS[0].id;
     this.localPose = {
       x: WORLD_SIZE / 2,
@@ -133,6 +133,7 @@ export class BattleRoyaleGame {
       E: 0,
       R: 0,
     };
+    this.showMatchDetails = false;
 
     this.keys = new Set();
     this.justPressed = new Set();
@@ -182,6 +183,7 @@ export class BattleRoyaleGame {
     this.syncRendererSize();
     this.bindInput();
     this.bindMobileControls();
+    this.bindAbilityUi();
     this.refreshAbilityBar();
     this.loop = this.loop.bind(this);
     window.requestAnimationFrame(this.loop);
@@ -443,6 +445,14 @@ export class BattleRoyaleGame {
         return;
       }
 
+      if (event.code === "Tab") {
+        if (this.snapshot.meta?.state === "running" || this.snapshot.meta?.state === "ended") {
+          event.preventDefault();
+          this.showMatchDetails = true;
+        }
+        return;
+      }
+
       const isGameplayKey = ["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE", "KeyR", "Enter"].includes(event.code);
       if (isGameplayKey && this.snapshot.meta?.state === "running") {
         event.preventDefault();
@@ -457,6 +467,10 @@ export class BattleRoyaleGame {
     });
 
     window.addEventListener("keyup", (event) => {
+      if (event.code === "Tab") {
+        this.showMatchDetails = false;
+        return;
+      }
       this.keys.delete(event.code);
     });
 
@@ -468,6 +482,8 @@ export class BattleRoyaleGame {
       this.resetJoystick(this.mobile.aim, this.ui.aimStick, true);
       this.keys.clear();
       this.justPressed.clear();
+      this.showMatchDetails = false;
+      this.hideAbilityTooltip();
     });
 
     window.addEventListener("resize", () => {
@@ -580,22 +596,129 @@ export class BattleRoyaleGame {
 
     Object.entries(this.ui.mobileAbilityButtons || {}).forEach(([slot, button]) => {
       const code = `Key${slot}`;
+      let activePointerId = null;
+      let holdTimer = null;
+      let showingTooltip = false;
+
       button.addEventListener("pointerdown", async (event) => {
         if (!this.mobile.enabled) {
           return;
         }
         event.preventDefault();
+        activePointerId = event.pointerId;
+        showingTooltip = false;
         button.setPointerCapture?.(event.pointerId);
         button.classList.add("is-active");
-        this.justPressed.add(code);
         await this.audio.boot();
+        holdTimer = window.setTimeout(() => {
+          showingTooltip = true;
+          this.showAbilityTooltip(button);
+        }, 420);
       });
-      const clear = () => button.classList.remove("is-active");
-      button.addEventListener("pointerup", clear);
+
+      const clear = (event, triggerAbility = false) => {
+        if (event && activePointerId !== null && event.pointerId !== activePointerId) {
+          return;
+        }
+        if (holdTimer) {
+          window.clearTimeout(holdTimer);
+          holdTimer = null;
+        }
+        if (triggerAbility && !showingTooltip) {
+          this.justPressed.add(code);
+        }
+        showingTooltip = false;
+        activePointerId = null;
+        button.classList.remove("is-active");
+        this.hideAbilityTooltip();
+      };
+
+      button.addEventListener("pointerup", (event) => clear(event, true));
       button.addEventListener("pointercancel", clear);
       button.addEventListener("pointerleave", clear);
       button.addEventListener("lostpointercapture", clear);
     });
+  }
+
+  bindAbilityUi() {
+    if (!this.ui.abilityBar) {
+      return;
+    }
+
+    const resolveButton = (target) => target?.closest?.("[data-ability-slot]");
+
+    this.ui.abilityBar.addEventListener("pointerdown", (event) => {
+      const button = resolveButton(event.target);
+      if (!button) {
+        return;
+      }
+      event.preventDefault();
+      this.canvas.focus();
+    });
+
+    this.ui.abilityBar.addEventListener("pointerover", (event) => {
+      if (this.mobile.enabled) {
+        return;
+      }
+      const button = resolveButton(event.target);
+      if (!button) {
+        return;
+      }
+      this.showAbilityTooltip(button);
+    });
+
+    this.ui.abilityBar.addEventListener("pointermove", (event) => {
+      if (this.mobile.enabled) {
+        return;
+      }
+      const button = resolveButton(event.target);
+      if (!button) {
+        this.hideAbilityTooltip();
+        return;
+      }
+      this.showAbilityTooltip(button);
+    });
+
+    this.ui.abilityBar.addEventListener("pointerleave", () => {
+      this.hideAbilityTooltip();
+    });
+  }
+
+  showAbilityTooltip(target) {
+    if (!this.ui.abilityTooltip || !target) {
+      return;
+    }
+
+    const abilityName = target.dataset.abilityName || target.dataset.abilitySlot || "";
+    const abilityDetail = target.dataset.abilityDetail || "";
+    if (!abilityName && !abilityDetail) {
+      this.hideAbilityTooltip();
+      return;
+    }
+
+    this.ui.abilityTooltip.innerHTML = `
+      <strong>${escapeHtml(abilityName)}</strong>
+      <span>${escapeHtml(abilityDetail)}</span>
+    `;
+    this.ui.abilityTooltip.hidden = false;
+
+    const targetRect = target.getBoundingClientRect();
+    const tooltipRect = this.ui.abilityTooltip.getBoundingClientRect();
+    const left = clamp(
+      targetRect.left + targetRect.width * 0.5 - tooltipRect.width * 0.5,
+      12,
+      window.innerWidth - tooltipRect.width - 12
+    );
+    const top = Math.max(12, targetRect.top - tooltipRect.height - 12);
+    this.ui.abilityTooltip.style.left = `${left}px`;
+    this.ui.abilityTooltip.style.top = `${top}px`;
+  }
+
+  hideAbilityTooltip() {
+    if (!this.ui.abilityTooltip) {
+      return;
+    }
+    this.ui.abilityTooltip.hidden = true;
   }
 
   resetJoystick(state, stick, isAim = false) {
@@ -622,7 +745,7 @@ export class BattleRoyaleGame {
   }
 
   setPlayerName(name) {
-    this.playerName = name || "Piloto";
+    this.playerName = name || "Player";
   }
 
   setSelectedLoadout(loadoutId) {
@@ -663,6 +786,8 @@ export class BattleRoyaleGame {
     this.processedEvents.clear();
     this.processedQueue = [];
     this.hitFlashes.clear();
+    this.showMatchDetails = false;
+    this.hideAbilityTooltip();
     this.localTimers = {
       primaryReadyAt: 0,
       Q: 0,
@@ -935,13 +1060,13 @@ export class BattleRoyaleGame {
         const target =
           event.targetId === this.snapshot.localPlayerId
             ? this.playerName
-            : this.snapshot.players?.[event.targetId]?.name || "Piloto";
+            : this.snapshot.players?.[event.targetId]?.name || "Player";
         this.killFeed.unshift({
           id: event.id,
           text: `${attacker} eliminou ${target}`,
-          expiresAt: Date.now() + 5500,
+          expiresAt: Date.now() + 2800,
         });
-        this.killFeed = this.killFeed.slice(0, 5);
+        this.killFeed = this.killFeed.slice(0, 3);
         this.audio.play("elimination");
         break;
       }
@@ -1214,7 +1339,7 @@ export class BattleRoyaleGame {
     if (!label.context || !label.sprite) {
       return;
     }
-    const safeName = String(name || "Piloto").slice(0, 18);
+    const safeName = String(name || "Player").slice(0, 18);
     const renderKey = `${safeName}:${isLocal ? "local" : "remote"}`;
     if (label.renderedKey === renderKey) {
       return;
@@ -1549,7 +1674,7 @@ export class BattleRoyaleGame {
     healthFill.position.z = 0.2;
     healthGroup.add(healthFill);
 
-    const nameplate = this.createNameplateSprite(player.name || "Piloto");
+    const nameplate = this.createNameplateSprite(player.name || "Player");
     group.add(nameplate.sprite);
     group.add(healthGroup);
     this.worldRoot.add(group);
@@ -2031,6 +2156,9 @@ export class BattleRoyaleGame {
     }
 
     this.lastHudRefresh = now;
+    if (this.snapshot.meta?.state !== "running" && this.snapshot.meta?.state !== "ended") {
+      this.showMatchDetails = false;
+    }
     const localRecord = this.getLocalRecord();
     const loadout = getLoadout(localRecord?.loadoutId || this.selectedLoadoutId);
     const alive = Object.values(this.snapshot.players || {}).filter((player) => player.alive !== false).length;
@@ -2069,7 +2197,7 @@ export class BattleRoyaleGame {
     }
 
     const winnerName = this.snapshot.meta?.winnerId
-      ? this.snapshot.players?.[this.snapshot.meta.winnerId]?.name || "Piloto"
+      ? this.snapshot.players?.[this.snapshot.meta.winnerId]?.name || "Player"
       : "Sem vencedor";
     this.ui.winnerReadout.textContent =
       this.snapshot.meta?.winnerId ? `Vencedor: ${winnerName}` : "Sem vencedor";
@@ -2092,8 +2220,22 @@ export class BattleRoyaleGame {
         : `<article class="score-row"><strong>Nenhum jogador</strong><span>Placares aparecem durante a sala.</span></article>`;
     }
 
+    this.refreshMatchDetailsVisibility();
     this.refreshAbilityBar(now);
     this.refreshRespawnOverlay(localRecord, now);
+  }
+
+  refreshMatchDetailsVisibility() {
+    const hudVisible = !this.mobile.enabled && this.snapshot.meta?.state === "running";
+    const detailsVisible = hudVisible && this.showMatchDetails;
+
+    if (this.ui.hudDetails) {
+      this.ui.hudDetails.hidden = !hudVisible;
+    }
+
+    if (this.ui.statusGrid) {
+      this.ui.statusGrid.hidden = !detailsVisible;
+    }
   }
 
   refreshRespawnOverlay(localRecord, now) {
@@ -2109,43 +2251,29 @@ export class BattleRoyaleGame {
       return;
     }
 
-    if (this.snapshot.meta?.state === "ended" && this.snapshot.meta?.winnerId) {
-      const winner = this.snapshot.players?.[this.snapshot.meta.winnerId]?.name || "Piloto";
-      this.ui.respawnOverlay.hidden = false;
-      this.ui.respawnLabel.textContent = `Partida encerrada. ${winner} venceu.`;
-      this.ui.respawnTimer.textContent = "00:00";
-      return;
-    }
-
     this.ui.respawnOverlay.hidden = true;
   }
 
   refreshAbilityBar(now = Date.now()) {
-    const loadout = getLoadout(this.selectedLoadoutId);
-    const cards = [
-      {
-        slot: "Mouse",
-        name: loadout.primary.label,
-        detail: "Disparo principal",
-        readyIn: Math.max(0, this.localTimers.primaryReadyAt - now),
-      },
-      ...loadout.abilities.map((ability) => ({
-        slot: ability.slot,
-        name: ability.name,
-        detail: ability.summary,
-        readyIn: Math.max(0, (this.localTimers[ability.slot] || 0) - now),
-      })),
-    ];
+    const localRecord = this.getLocalRecord();
+    const loadout = getLoadout(localRecord?.loadoutId || this.selectedLoadoutId);
 
-    this.ui.abilityBar.innerHTML = cards
-      .map((card) => {
-        const cooling = card.readyIn > 0;
+    this.ui.abilityBar.innerHTML = loadout.abilities
+      .map((ability) => {
+        const readyIn = Math.max(0, (this.localTimers[ability.slot] || 0) - now);
+        const cooldownValue = readyIn > 0 ? String(Math.ceil(readyIn / 1000)) : "";
         return `
-          <article class="ability-card ${cooling ? "is-cooling" : ""}">
-            <small>${card.slot}</small>
-            <strong>${card.name}</strong>
-            <small>${cooling ? `Pronto em ${formatClock(card.readyIn)}` : card.detail}</small>
-          </article>
+          <button
+            type="button"
+            class="ability-slot ${readyIn > 0 ? "is-cooling" : ""}"
+            data-ability-slot="${ability.slot}"
+            data-ability-name="${escapeHtml(ability.name)}"
+            data-ability-detail="${escapeHtml(ability.summary)}"
+            tabindex="-1"
+          >
+            <span class="ability-slot__key">${ability.slot}</span>
+            <span class="ability-slot__cooldown">${cooldownValue}</span>
+          </button>
         `;
       })
       .join("");
@@ -2158,11 +2286,14 @@ export class BattleRoyaleGame {
       const readyIn = Math.max(0, (this.localTimers[slot] || 0) - now);
       const label = button.querySelector("[data-mobile-label]");
       const meta = button.querySelector("[data-mobile-meta]");
+      button.dataset.abilitySlot = ability.slot;
+      button.dataset.abilityName = ability.name;
+      button.dataset.abilityDetail = ability.summary;
       if (label) {
-        label.textContent = ability.name;
+        label.textContent = ability.slot;
       }
       if (meta) {
-        meta.textContent = readyIn > 0 ? formatClock(readyIn) : slot;
+        meta.textContent = readyIn > 0 ? String(Math.ceil(readyIn / 1000)) : "";
       }
       button.classList.toggle("is-cooling", readyIn > 0);
     });

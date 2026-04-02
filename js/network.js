@@ -32,6 +32,23 @@ const RECON_REVEAL_DURATION_MS = 700;
 const GRAVITY_PULL_STEP_SCALE = 0.012;
 const GRAVITY_PULL_CENTER_PAD = 10;
 
+function normalizeProfileName(value) {
+  return String(value ?? "").trim().slice(0, 18);
+}
+
+function formatAutoPlayerName(slotNumber) {
+  return slotNumber > 0 ? `Player ${slotNumber}` : "Player";
+}
+
+function resolveProfileDisplayName(profile = {}) {
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  if (profile.nameCustomized && customName) {
+    return customName;
+  }
+  return formatAutoPlayerName(slotNumber);
+}
+
 function emptyMatchState() {
   return {
     state: "idle",
@@ -53,8 +70,13 @@ function safeArray(value) {
 
 function createProfileState(profile = {}) {
   const loadout = getLoadout(profile.loadoutId || LOADOUTS[0].id);
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  const nameCustomized = Boolean(profile.nameCustomized && customName);
   return {
-    name: profile.name || "Piloto",
+    name: nameCustomized ? customName : "",
+    nameCustomized,
+    slotNumber,
     loadoutId: loadout.id,
     color: profile.color || loadout.theme,
     joinedAt: profile.joinedAt || Date.now(),
@@ -72,8 +94,15 @@ function createPoseState(pose = {}) {
 
 function createCombatState(profile = {}, patch = {}) {
   const loadout = getLoadout(profile.loadoutId || patch.loadoutId || LOADOUTS[0].id);
+  const resolvedProfile = {
+    ...profile,
+    ...patch,
+    slotNumber: patch.slotNumber ?? profile.slotNumber,
+    name: patch.name ?? profile.name,
+    nameCustomized: patch.nameCustomized ?? profile.nameCustomized,
+  };
   return {
-    name: profile.name || patch.name || "Piloto",
+    name: resolveProfileDisplayName(resolvedProfile),
     loadoutId: loadout.id,
     color: profile.color || patch.color || loadout.theme,
     health: patch.health ?? loadout.maxHealth,
@@ -264,7 +293,9 @@ class PlayroomRoomService {
 
     return {
       id: playerState.id,
-      name: profile.name || combat.name || "Piloto",
+      name: resolveProfileDisplayName(profile),
+      nameCustomized: Boolean(profile.nameCustomized),
+      slotNumber: Math.max(0, Number(profile.slotNumber) || 0),
       loadoutId: profile.loadoutId || combat.loadoutId || loadout.id,
       color: profile.color || combat.color || loadout.theme,
       joinedAt: profile.joinedAt || Date.now(),
@@ -355,7 +386,54 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
+    this.assignRoomPlayerSlots();
+
     this.emitSnapshot();
+  }
+
+  nextAvailablePlayerSlot(usedSlots) {
+    let slotNumber = 1;
+    while (usedSlots.has(slotNumber)) {
+      slotNumber += 1;
+    }
+    return slotNumber;
+  }
+
+  assignRoomPlayerSlots() {
+    if (!this.connected || !this.playroom?.isHost()) {
+      return;
+    }
+
+    const usedSlots = new Set();
+    const players = this.getOrderedPlayers();
+    players.forEach((playerState) => {
+      const currentProfile = createProfileState(playerState.getState(PROFILE_KEY) || {});
+      const hasValidSlot = currentProfile.slotNumber > 0 && !usedSlots.has(currentProfile.slotNumber);
+      const slotNumber = hasValidSlot ? currentProfile.slotNumber : this.nextAvailablePlayerSlot(usedSlots);
+      usedSlots.add(slotNumber);
+
+      const nextProfile = createProfileState({
+        ...currentProfile,
+        slotNumber,
+      });
+
+      const changed =
+        currentProfile.slotNumber !== nextProfile.slotNumber ||
+        currentProfile.name !== nextProfile.name ||
+        currentProfile.nameCustomized !== nextProfile.nameCustomized;
+
+      if (!changed) {
+        return;
+      }
+
+      playerState.setState(PROFILE_KEY, nextProfile, true);
+
+      const match = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+      if (match.state !== "running") {
+        const currentCombat = playerState.getState(COMBAT_KEY) || createCombatState(nextProfile);
+        playerState.setState(COMBAT_KEY, createCombatState(nextProfile, currentCombat), true);
+      }
+    });
   }
 
   async connect(profile, roomCode = "") {
@@ -401,7 +479,7 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
-    const runningMatch = this.matchState.state === "running" || this.matchState.state === "ended";
+    const runningMatch = this.matchState.state === "running";
     if (runningMatch && requestedRoomCode) {
       await this.localPlayer.leaveRoom();
       this.connected = false;
@@ -413,6 +491,7 @@ class PlayroomRoomService {
       this.localPlayer.setState(COMBAT_KEY, createCombatState(profileState), true);
       this.localPlayer.setState(POSE_KEY, createPoseState(), false);
     }
+    this.assignRoomPlayerSlots();
 
     this.startPolling();
     this.syncHostLoopStatus();
@@ -436,6 +515,7 @@ class PlayroomRoomService {
     const nextProfile = createProfileState({
       ...profile,
       joinedAt: this.localPlayer.getState(PROFILE_KEY)?.joinedAt || Date.now(),
+      slotNumber: this.localPlayer.getState(PROFILE_KEY)?.slotNumber || 0,
     });
 
     this.localPlayer.setState(PROFILE_KEY, nextProfile, true);
@@ -1427,6 +1507,8 @@ class PlayroomRoomService {
         this.authority.players.delete(playerId);
       }
     });
+
+    this.assignRoomPlayerSlots();
 
     if (this.matchState.state === "running") {
       this.simulateProjectiles(now);
