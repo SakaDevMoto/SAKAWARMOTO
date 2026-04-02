@@ -29,6 +29,9 @@ const refs = {
   shieldBar: document.getElementById("shieldBar"),
   shieldLabel: document.getElementById("shieldLabel"),
   abilityBar: document.getElementById("abilityBar"),
+  abilityTooltip: document.getElementById("abilityTooltip"),
+  hudDetails: document.getElementById("hudDetails"),
+  statusGrid: document.getElementById("statusGrid"),
   killFeed: document.getElementById("killFeed"),
   scoreboard: document.getElementById("scoreboard"),
   stormReadout: document.getElementById("stormReadout"),
@@ -44,6 +47,16 @@ const refs = {
   respawnOverlay: document.getElementById("respawnOverlay"),
   respawnLabel: document.getElementById("respawnLabel"),
   respawnTimer: document.getElementById("respawnTimer"),
+  matchMenuOverlay: document.getElementById("matchMenuOverlay"),
+  matchMenuCloseButton: document.getElementById("matchMenuCloseButton"),
+  matchMenuEndButton: document.getElementById("matchMenuEndButton"),
+  matchMenuLeaveButton: document.getElementById("matchMenuLeaveButton"),
+  matchMenuSoundButton: document.getElementById("matchMenuSoundButton"),
+  matchMenuSoundSection: document.getElementById("matchMenuSoundSection"),
+  matchMenuSoundSlider: document.getElementById("matchMenuSoundSlider"),
+  matchMenuSoundValue: document.getElementById("matchMenuSoundValue"),
+  matchMenuTransferSection: document.getElementById("matchMenuTransferSection"),
+  matchMenuTransferList: document.getElementById("matchMenuTransferList"),
   movePad: document.getElementById("movePad"),
   moveStick: document.getElementById("moveStick"),
   aimPad: document.getElementById("aimPad"),
@@ -62,6 +75,8 @@ const state = {
   noticeOverride: "",
   immersiveAppliedForMatchKey: null,
   gameViewActive: false,
+  matchMenuOpen: false,
+  matchSoundOpen: false,
 };
 
 function escapeHtml(value) {
@@ -73,7 +88,12 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-refs.playerName.value = window.localStorage.getItem("last-zone-player-name") || "SakaPilot";
+function isEditableTarget(target) {
+  const tagName = target?.tagName?.toUpperCase?.() || "";
+  return Boolean(target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(tagName));
+}
+
+refs.playerName.value = "Player";
 refs.selectedWeaponBadge.textContent = getLoadout(state.selectedLoadoutId).name;
 refs.practiceButton.textContent = descriptor.mode === "playroom" ? "Sala Solo Instantanea" : "Playroom Indisponivel";
 
@@ -85,6 +105,9 @@ const game = new BattleRoyaleGame({
     shieldBar: refs.shieldBar,
     shieldLabel: refs.shieldLabel,
     abilityBar: refs.abilityBar,
+    abilityTooltip: refs.abilityTooltip,
+    hudDetails: refs.hudDetails,
+    statusGrid: refs.statusGrid,
     killFeed: refs.killFeed,
     scoreboard: refs.scoreboard,
     stormReadout: refs.stormReadout,
@@ -116,12 +139,19 @@ const game = new BattleRoyaleGame({
   },
 });
 
-function currentProfile() {
-  const loadout = getLoadout(state.selectedLoadoutId);
+function currentProfile({ customName = true } = {}) {
+  const trimmedName = refs.playerName.value.trim().slice(0, 18);
+  const localRecord = state.snapshot?.players?.[state.snapshot?.localPlayerId] || null;
+  const assignedAutoName =
+    localRecord?.slotNumber > 0 ? `Player ${localRecord.slotNumber}` : localRecord?.name || "Player";
+  const followsAssignedAutoName =
+    customName && Boolean(trimmedName) && trimmedName === assignedAutoName && localRecord?.nameCustomized === false;
+  const nameCustomized = customName && Boolean(trimmedName) && !followsAssignedAutoName;
   return {
-    name: refs.playerName.value.trim() || "Piloto",
+    name: nameCustomized ? trimmedName : "",
+    nameCustomized,
     loadoutId: state.selectedLoadoutId,
-    color: loadout.theme,
+    color: localRecord?.color,
   };
 }
 
@@ -140,7 +170,7 @@ function setNotice(message, isError = false) {
 }
 
 function isMatchActive(snapshot) {
-  return snapshot?.meta?.state === "running" || snapshot?.meta?.state === "ended";
+  return snapshot?.meta?.state === "running";
 }
 
 function currentMatchKey(snapshot) {
@@ -202,6 +232,83 @@ function syncGameView(snapshot) {
   }
 }
 
+function getHumanPlayers(snapshot) {
+  return Object.values(snapshot?.players || {}).filter((player) => !player.isBot);
+}
+
+function getTransferCandidates(snapshot) {
+  return getHumanPlayers(snapshot).filter((player) => player.id !== snapshot?.localPlayerId);
+}
+
+function renderMatchMenu() {
+  if (!refs.matchMenuOverlay || !refs.matchMenuTransferList) {
+    return;
+  }
+
+  const snapshot = state.snapshot;
+  const isHost = Boolean(snapshot?.isHost);
+  const targets = isHost ? getTransferCandidates(snapshot) : [];
+
+  refs.matchMenuEndButton.hidden = !isHost;
+  refs.matchMenuLeaveButton.hidden = !snapshot?.roomId;
+  if (refs.matchMenuSoundSection) {
+    refs.matchMenuSoundSection.hidden = !state.matchSoundOpen;
+  }
+  if (refs.matchMenuSoundSlider) {
+    refs.matchMenuSoundSlider.value = String(Math.round(audio.getEffectsVolume() * 100));
+  }
+  if (refs.matchMenuSoundValue) {
+    refs.matchMenuSoundValue.textContent = `${Math.round(audio.getEffectsVolume() * 100)}%`;
+  }
+  refs.matchMenuTransferSection.hidden = !isHost || !targets.length;
+  refs.matchMenuTransferList.innerHTML = targets
+    .map(
+      (player) => `
+        <button type="button" class="button button--ghost" data-transfer-host="${player.id}">
+          ${escapeHtml(player.name || "Player")}
+        </button>
+      `
+    )
+    .join("");
+}
+
+function setMatchMenuOpen(open) {
+  const nextValue = Boolean(open && state.gameViewActive && state.snapshot?.roomId);
+  state.matchMenuOpen = nextValue;
+  if (!nextValue) {
+    state.matchSoundOpen = false;
+  }
+
+  if (refs.matchMenuOverlay) {
+    refs.matchMenuOverlay.hidden = !nextValue;
+  }
+
+  if (nextValue) {
+    renderMatchMenu();
+  }
+
+  game.setMenuOpen(nextValue);
+
+  if (!nextValue && state.gameViewActive) {
+    refs.gameCanvas.focus();
+  }
+}
+
+function toggleSoundMenu() {
+  state.matchSoundOpen = !state.matchSoundOpen;
+  if (state.matchMenuOpen) {
+    renderMatchMenu();
+  }
+}
+
+function updateEffectsVolume(value) {
+  const volume = Math.max(0, Math.min(100, Number(value) || 0));
+  audio.setEffectsVolume(volume / 100);
+  if (refs.matchMenuSoundValue) {
+    refs.matchMenuSoundValue.textContent = `${Math.round(volume)}%`;
+  }
+}
+
 function renderWeapons() {
   refs.weaponGrid.innerHTML = LOADOUTS.map(
     (loadout) => `
@@ -252,7 +359,12 @@ function renderWeaponDetail() {
         .map(
           (ability) => `
             <div class="detail-skill">
-              <strong>${ability.slot}</strong> ${ability.name}<br>
+              <div class="detail-skill__head">
+                <div>
+                  <strong>${ability.slot}</strong> ${ability.name}
+                </div>
+                ${ability.damageLabel ? `<small class="detail-skill__damage">${ability.damageLabel}</small>` : ""}
+              </div>
               <small>${ability.summary}</small>
             </div>
           `
@@ -269,11 +381,18 @@ function renderPlayerList(snapshot) {
     ? players
         .map((player) => {
           const loadout = getLoadout(player.loadoutId || LOADOUTS[0].id);
-          const stateTag = snapshot.meta.hostId === player.id ? "Host" : player.alive === false ? "Eliminado" : "Online";
+          const inMatch = snapshot.meta?.state === "running";
+          const stateTag = player.isBot
+            ? "Bot"
+            : snapshot.meta.hostId === player.id
+              ? "Host"
+              : inMatch && player.alive === false
+                ? "Eliminado"
+                : "Na sala";
           return `
             <article class="player-chip">
               <div>
-                <strong>${escapeHtml(player.name || "Piloto")}</strong>
+                <strong>${escapeHtml(player.name || "Player")}</strong>
                 <small>${loadout.name} // ${player.kills || 0}K ${player.deaths || 0}D</small>
               </div>
               <small>${stateTag}</small>
@@ -289,25 +408,27 @@ function renderPlayerList(snapshot) {
 function updateButtons(snapshot) {
   const hasRoom = Boolean(snapshot.roomId);
   const running = snapshot.meta?.state === "running";
+  const humanCount = getHumanPlayers(snapshot).length;
+  const canStartSolo =
+    descriptor.mode === "playroom" && !running && humanCount <= 1 && (!hasRoom || snapshot.isHost);
   refs.copyRoomButton.disabled = !hasRoom;
   refs.leaveRoomButton.disabled = !hasRoom;
   refs.startMatchButton.disabled = !hasRoom || running || !snapshot.isHost;
-  refs.practiceButton.disabled = descriptor.mode !== "playroom";
+  refs.practiceButton.disabled = !canStartSolo;
   refs.createRoomButton.disabled = hasRoom;
   refs.joinRoomButton.disabled = hasRoom;
   refs.roomCodeInput.disabled = hasRoom;
 }
 
 async function syncLobbyProfile() {
-  window.localStorage.setItem("last-zone-player-name", refs.playerName.value.trim() || "Piloto");
-  game.setPlayerName(refs.playerName.value.trim() || "Piloto");
+  game.setPlayerName(refs.playerName.value.trim() || "Player");
 
   if (!state.snapshot?.roomId) {
     return;
   }
 
   try {
-    await roomService.updateLobbyProfile(currentProfile());
+    await roomService.updateLobbyProfile(currentProfile({ customName: true }));
   } catch (error) {
     setNotice(error.message, true);
   }
@@ -316,7 +437,7 @@ async function syncLobbyProfile() {
 async function createRoom() {
   try {
     await audio.boot();
-    await roomService.createRoom(currentProfile());
+    await roomService.createRoom(currentProfile({ customName: false }));
     setNotice("Sala criada. Compartilhe o codigo e aguarde ate 10 jogadores.");
     audio.play("join");
   } catch (error) {
@@ -333,7 +454,7 @@ async function joinRoom() {
 
   try {
     await audio.boot();
-    await roomService.joinRoom(roomCode, currentProfile());
+    await roomService.joinRoom(roomCode, currentProfile({ customName: false }));
     setNotice("Voce entrou na sala. Aguarde o host iniciar a partida.");
     audio.play("join");
   } catch (error) {
@@ -355,10 +476,24 @@ async function startMatch() {
 async function startSoloRoom() {
   try {
     await audio.boot();
-    await roomService.createRoom(currentProfile());
+    const humanCount = getHumanPlayers(state.snapshot).length;
+    if (humanCount > 1) {
+      setNotice("A sala solo so pode ser aberta quando voce estiver sozinho.", true);
+      return;
+    }
+
+    if (state.snapshot?.roomId && !state.snapshot?.isHost) {
+      setNotice("Voce precisa ser o host para abrir a sala solo.", true);
+      return;
+    }
+
+    if (!state.snapshot?.roomId) {
+      await roomService.createRoom(currentProfile({ customName: false }));
+    }
+
     const seed = Date.now() ^ seedFromText(`solo-${state.selectedLoadoutId}`);
-    await roomService.startMatch(seed);
-    setNotice("Sala solo criada. A arena 3D foi iniciada com respawn e placar ativos.");
+    await roomService.startSoloPractice(seed);
+    setNotice("Sala solo criada. Um bot de treino entrou e a partida foi iniciada.");
   } catch (error) {
     setNotice(error.message, true);
   }
@@ -367,6 +502,32 @@ async function startSoloRoom() {
 async function leaveRoom() {
   try {
     await roomService.leaveRoom();
+  } catch (error) {
+    setNotice(error.message, true);
+  }
+}
+
+async function endMatchEarly() {
+  try {
+    await roomService.endMatch();
+    setMatchMenuOpen(false);
+    setNotice("A partida foi encerrada pelo host.");
+  } catch (error) {
+    setNotice(error.message, true);
+  }
+}
+
+async function transferLeadership(playerId) {
+  const target = state.snapshot?.players?.[playerId];
+  if (!target) {
+    setNotice("Nao encontrei esse jogador para transferir a lideranca.", true);
+    return;
+  }
+
+  try {
+    await roomService.transferLeadership(playerId);
+    setMatchMenuOpen(false);
+    setNotice(`Lideranca transferida para ${target.name}.`);
   } catch (error) {
     setNotice(error.message, true);
   }
@@ -394,6 +555,45 @@ refs.practiceButton.addEventListener("click", startSoloRoom);
 refs.leaveRoomButton.addEventListener("click", leaveRoom);
 refs.startMatchButton.addEventListener("click", startMatch);
 refs.copyRoomButton.addEventListener("click", copyRoomCode);
+refs.matchMenuCloseButton?.addEventListener("click", () => setMatchMenuOpen(false));
+refs.matchMenuLeaveButton?.addEventListener("click", leaveRoom);
+refs.matchMenuEndButton?.addEventListener("click", endMatchEarly);
+refs.matchMenuSoundButton?.addEventListener("click", toggleSoundMenu);
+refs.matchMenuSoundSlider?.addEventListener("input", (event) => updateEffectsVolume(event.target.value));
+refs.matchMenuOverlay?.addEventListener("click", (event) => {
+  if (event.target === refs.matchMenuOverlay) {
+    setMatchMenuOpen(false);
+  }
+});
+refs.matchMenuTransferList?.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-transfer-host]");
+  if (!button) {
+    return;
+  }
+  transferLeadership(button.dataset.transferHost);
+});
+
+window.addEventListener(
+  "keydown",
+  (event) => {
+    if (!state.gameViewActive || isEditableTarget(event.target)) {
+      return;
+    }
+
+    if (event.code === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setMatchMenuOpen(!state.matchMenuOpen);
+      return;
+    }
+
+    if (state.matchMenuOpen) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  },
+  true
+);
 
 document.addEventListener("pointerdown", () => {
   if (!document.body.classList.contains("is-game-view")) {
@@ -405,6 +605,7 @@ document.addEventListener("pointerdown", () => {
 
 roomService.subscribe((snapshot) => {
   state.snapshot = snapshot;
+  const localRecord = snapshot.players?.[snapshot.localPlayerId] || null;
 
   if (snapshot.roomId) {
     refs.roomCodeInput.value = snapshot.roomId;
@@ -412,12 +613,21 @@ roomService.subscribe((snapshot) => {
     refs.roomCodeInput.value = "";
   }
 
+  if (localRecord?.name && document.activeElement !== refs.playerName) {
+    refs.playerName.value = localRecord.name;
+  }
+
   renderPlayerList(snapshot);
   updateButtons(snapshot);
-  game.setPlayerName(refs.playerName.value.trim() || "Piloto");
+  game.setPlayerName(refs.playerName.value.trim() || "Player");
   game.setSelectedLoadout(state.selectedLoadoutId);
   game.setSnapshot(snapshot);
   syncGameView(snapshot);
+  if (!state.gameViewActive || !snapshot.roomId) {
+    setMatchMenuOpen(false);
+  } else if (state.matchMenuOpen) {
+    renderMatchMenu();
+  }
   setNotice("");
 });
 
