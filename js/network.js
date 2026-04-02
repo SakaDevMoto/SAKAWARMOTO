@@ -31,6 +31,63 @@ const MINE_SLOW_DURATION_MS = 1800;
 const RECON_REVEAL_DURATION_MS = 700;
 const GRAVITY_PULL_STEP_SCALE = 0.012;
 const GRAVITY_PULL_CENTER_PAD = 10;
+const SOLO_BOT_LIMIT = 1;
+const BOT_DECISION_MIN_MS = 360;
+const BOT_DECISION_JITTER_MS = 320;
+const BOT_STORM_BUFFER = 110;
+const BOT_MINE_ATTRACTION_RADIUS = 560;
+const BOT_POSE_RELIABLE_INTERVAL_MS = 180;
+const PULSE_MINE_TRIGGER_RADIUS = 82;
+const PULSE_MINE_DAMAGE_RADIUS = 132;
+const PULSE_MINE_DAMAGE = 34;
+const PULSE_MINE_ARM_MS = 350;
+const PULSE_MINE_LIFETIME_MS = 8200;
+
+const BOT_PREFERRED_RANGE = {
+  tempest: 360,
+  ember: 220,
+  phantom: 760,
+  volt: 430,
+};
+
+function createAuthorityState(loadoutId = LOADOUTS[0].id) {
+  return {
+    nextPrimaryAt: 0,
+    cooldowns: { Q: 0, E: 0, R: 0 },
+    lastSeq: 0,
+    stormCarry: 0,
+    respawnQueuedAt: 0,
+    botNextDecisionAt: 0,
+    botStrafeDirection: 1,
+    botPreferredRange: BOT_PREFERRED_RANGE[loadoutId] || 340,
+    botBurstUntil: 0,
+    botPauseUntil: 0,
+    botWanderAngle: 0,
+    botReliablePoseAt: 0,
+  };
+}
+
+function scheduleBotFireWindow(authority, now) {
+  authority.botBurstUntil = now + 260 + Math.random() * 560;
+  authority.botPauseUntil = authority.botBurstUntil + 260 + Math.random() * 520;
+}
+
+function normalizeProfileName(value) {
+  return String(value ?? "").trim().slice(0, 18);
+}
+
+function formatAutoPlayerName(slotNumber) {
+  return slotNumber > 0 ? `Player ${slotNumber}` : "Player";
+}
+
+function resolveProfileDisplayName(profile = {}) {
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  if (profile.nameCustomized && customName) {
+    return customName;
+  }
+  return formatAutoPlayerName(slotNumber);
+}
 
 function emptyMatchState() {
   return {
@@ -53,8 +110,13 @@ function safeArray(value) {
 
 function createProfileState(profile = {}) {
   const loadout = getLoadout(profile.loadoutId || LOADOUTS[0].id);
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  const nameCustomized = Boolean(profile.nameCustomized && customName);
   return {
-    name: profile.name || "Piloto",
+    name: nameCustomized ? customName : "",
+    nameCustomized,
+    slotNumber,
     loadoutId: loadout.id,
     color: profile.color || loadout.theme,
     joinedAt: profile.joinedAt || Date.now(),
@@ -72,8 +134,15 @@ function createPoseState(pose = {}) {
 
 function createCombatState(profile = {}, patch = {}) {
   const loadout = getLoadout(profile.loadoutId || patch.loadoutId || LOADOUTS[0].id);
+  const resolvedProfile = {
+    ...profile,
+    ...patch,
+    slotNumber: patch.slotNumber ?? profile.slotNumber,
+    name: patch.name ?? profile.name,
+    nameCustomized: patch.nameCustomized ?? profile.nameCustomized,
+  };
   return {
-    name: profile.name || patch.name || "Piloto",
+    name: resolveProfileDisplayName(resolvedProfile),
     loadoutId: loadout.id,
     color: profile.color || patch.color || loadout.theme,
     health: patch.health ?? loadout.maxHealth,
@@ -155,6 +224,24 @@ function comparePlayersForScore(left, right) {
   return (left.joinedAt || 0) - (right.joinedAt || 0);
 }
 
+function isBotPlayerState(playerState) {
+  return Boolean(playerState && typeof playerState.isBot === "function" && playerState.isBot());
+}
+
+function createPracticeBotClass(playroom) {
+  const BotBase = playroom?.Bot;
+  if (!BotBase) {
+    return null;
+  }
+
+  return class PracticeBot extends BotBase {
+    constructor(botParams = {}) {
+      super(botParams);
+      this.botParams = botParams;
+    }
+  };
+}
+
 function hasPlayroomConfig(config) {
   return Boolean(
     (window.Playroom || null) &&
@@ -198,6 +285,7 @@ class PlayroomRoomService {
     this.rpcRegistered = false;
     this.lastMatchPushAt = 0;
     this.matchState = emptyMatchState();
+    this.botClass = createPracticeBotClass(this.playroom);
     this.authority = {
       players: new Map(),
       projectiles: new Map(),
@@ -264,7 +352,10 @@ class PlayroomRoomService {
 
     return {
       id: playerState.id,
-      name: profile.name || combat.name || "Piloto",
+      name: resolveProfileDisplayName(profile),
+      nameCustomized: Boolean(profile.nameCustomized),
+      slotNumber: Math.max(0, Number(profile.slotNumber) || 0),
+      isBot: isBotPlayerState(playerState),
       loadoutId: profile.loadoutId || combat.loadoutId || loadout.id,
       color: profile.color || combat.color || loadout.theme,
       joinedAt: profile.joinedAt || Date.now(),
@@ -344,7 +435,7 @@ class PlayroomRoomService {
   }
 
   registerPlayer(playerState) {
-    if (!playerState) {
+    if (!playerState || this.players.has(playerState.id)) {
       return;
     }
 
@@ -355,7 +446,54 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
+    this.assignRoomPlayerSlots();
+
     this.emitSnapshot();
+  }
+
+  nextAvailablePlayerSlot(usedSlots) {
+    let slotNumber = 1;
+    while (usedSlots.has(slotNumber)) {
+      slotNumber += 1;
+    }
+    return slotNumber;
+  }
+
+  assignRoomPlayerSlots() {
+    if (!this.connected || !this.playroom?.isHost()) {
+      return;
+    }
+
+    const usedSlots = new Set();
+    const players = this.getOrderedPlayers();
+    players.forEach((playerState) => {
+      const currentProfile = createProfileState(playerState.getState(PROFILE_KEY) || {});
+      const hasValidSlot = currentProfile.slotNumber > 0 && !usedSlots.has(currentProfile.slotNumber);
+      const slotNumber = hasValidSlot ? currentProfile.slotNumber : this.nextAvailablePlayerSlot(usedSlots);
+      usedSlots.add(slotNumber);
+
+      const nextProfile = createProfileState({
+        ...currentProfile,
+        slotNumber,
+      });
+
+      const changed =
+        currentProfile.slotNumber !== nextProfile.slotNumber ||
+        currentProfile.name !== nextProfile.name ||
+        currentProfile.nameCustomized !== nextProfile.nameCustomized;
+
+      if (!changed) {
+        return;
+      }
+
+      playerState.setState(PROFILE_KEY, nextProfile, true);
+
+      const match = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+      if (match.state !== "running") {
+        const currentCombat = playerState.getState(COMBAT_KEY) || createCombatState(nextProfile);
+        playerState.setState(COMBAT_KEY, createCombatState(nextProfile, currentCombat), true);
+      }
+    });
   }
 
   async connect(profile, roomCode = "") {
@@ -372,6 +510,15 @@ class PlayroomRoomService {
       gameId: this.config.playroomGameId,
       roomCode: requestedRoomCode || undefined,
       skipLobby: true,
+      enableBots: Boolean(this.botClass),
+      botOptions: this.botClass
+        ? {
+            botClass: this.botClass,
+            botParams: {
+              role: "practice-bot",
+            },
+          }
+        : undefined,
       maxPlayersPerRoom: Math.max(2, this.config.maxPlayersPerRoom || MAX_PLAYERS),
       reconnectGracePeriod: this.config.reconnectGracePeriodMs || 15000,
       baseUrl: this.config.roomBaseUrl || undefined,
@@ -401,7 +548,7 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
-    const runningMatch = this.matchState.state === "running" || this.matchState.state === "ended";
+    const runningMatch = this.matchState.state === "running";
     if (runningMatch && requestedRoomCode) {
       await this.localPlayer.leaveRoom();
       this.connected = false;
@@ -413,6 +560,7 @@ class PlayroomRoomService {
       this.localPlayer.setState(COMBAT_KEY, createCombatState(profileState), true);
       this.localPlayer.setState(POSE_KEY, createPoseState(), false);
     }
+    this.assignRoomPlayerSlots();
 
     this.startPolling();
     this.syncHostLoopStatus();
@@ -436,6 +584,7 @@ class PlayroomRoomService {
     const nextProfile = createProfileState({
       ...profile,
       joinedAt: this.localPlayer.getState(PROFILE_KEY)?.joinedAt || Date.now(),
+      slotNumber: this.localPlayer.getState(PROFILE_KEY)?.slotNumber || 0,
     });
 
     this.localPlayer.setState(PROFILE_KEY, nextProfile, true);
@@ -531,17 +680,126 @@ class PlayroomRoomService {
 
       player.setState(POSE_KEY, createPoseState({ x: spawn.x, y: spawn.y, aim: 0 }), false);
       player.setState(COMBAT_KEY, combat, true);
-      this.authority.players.set(player.id, {
-        nextPrimaryAt: 0,
-        cooldowns: { Q: 0, E: 0, R: 0 },
-        lastSeq: 0,
-        stormCarry: 0,
-        respawnQueuedAt: 0,
-      });
+      this.authority.players.set(player.id, createAuthorityState(profile.loadoutId));
     });
 
     this.pendingMatchSync = true;
     this.flushMatchState(true);
+    this.emitSnapshot();
+  }
+
+  async startSoloPractice(seed) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("A sala solo so pode ser iniciada pelo host.");
+    }
+
+    await this.ensurePracticeBots(seed);
+    await this.startMatch(seed);
+  }
+
+  async endMatch() {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode encerrar a partida.");
+    }
+
+    const now = Date.now();
+    const players = this.getOrderedPlayers();
+    const previous = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+
+    this.matchState = {
+      ...emptyMatchState(),
+      hostId: this.localPlayer.id,
+      revision: (previous.revision || 0) + 1,
+      updatedAt: now,
+    };
+
+    this.authority.projectiles.clear();
+    this.authority.effects.clear();
+    this.authority.players.clear();
+
+    players.forEach((playerState) => {
+      const profile = this.getProfileState(playerState.id);
+      const loadout = getLoadout(profile.loadoutId);
+
+      playerState.setState(POSE_KEY, createPoseState(), false);
+      playerState.setState(
+        COMBAT_KEY,
+        createCombatState(profile, {
+          health: loadout.maxHealth,
+          shield: loadout.maxShield,
+          alive: true,
+          kills: 0,
+          deaths: 0,
+          respawns: 0,
+          respawnAt: 0,
+          effects: {},
+        }),
+        true
+      );
+      this.authority.players.set(playerState.id, createAuthorityState(profile.loadoutId));
+    });
+
+    this.pendingMatchSync = true;
+    this.flushMatchState(true);
+    this.emitSnapshot();
+  }
+
+  async transferLeadership(targetPlayerId) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode transferir a lideranca.");
+    }
+
+    const target = this.players.get(targetPlayerId);
+    if (!target || target.id === this.localPlayer.id || isBotPlayerState(target)) {
+      throw new Error("Escolha um jogador valido para receber a lideranca.");
+    }
+
+    if (typeof this.playroom.transferHost !== "function") {
+      throw new Error("Esta versao do Playroom nao permite transferir a lideranca.");
+    }
+
+    await this.playroom.transferHost(targetPlayerId);
+  }
+
+  async ensurePracticeBots(seed) {
+    if (!this.botClass || typeof this.playroom?.addBot !== "function") {
+      throw new Error("Seu Playroom atual nao expoe suporte a bots nesta pagina.");
+    }
+
+    const existingBots = this.getOrderedPlayers().filter((playerState) => isBotPlayerState(playerState));
+    if (existingBots.length >= SOLO_BOT_LIMIT) {
+      return;
+    }
+
+    for (let index = existingBots.length; index < SOLO_BOT_LIMIT; index += 1) {
+      const bot = await this.playroom.addBot();
+      if (!this.players.has(bot.id)) {
+        this.registerPlayer(bot);
+      }
+      this.setupPracticeBot(bot, index + 1, seed);
+    }
+  }
+
+  setupPracticeBot(bot, index, seed) {
+    if (!bot) {
+      return;
+    }
+
+    const loadoutSeed = Math.abs(seedFromText(`practice-bot:${seed}:${index}`));
+    const loadout = LOADOUTS[loadoutSeed % LOADOUTS.length];
+    const profile = createProfileState({
+      name: `Bot ${index}`,
+      nameCustomized: true,
+      slotNumber: 0,
+      loadoutId: loadout.id,
+      color: loadout.theme,
+      joinedAt: Date.now() + index,
+    });
+
+    bot.setState(PROFILE_KEY, profile, true);
+    bot.setState(POSE_KEY, createPoseState(), false);
+    bot.setState(COMBAT_KEY, createCombatState(profile), true);
+    this.assignRoomPlayerSlots();
     this.emitSnapshot();
   }
 
@@ -551,7 +809,9 @@ class PlayroomRoomService {
     }
 
     if (this.playroom.isHost()) {
-      const others = this.getOrderedPlayers().filter((player) => player.id !== this.localPlayer.id);
+      const others = this.getOrderedPlayers().filter(
+        (player) => player.id !== this.localPlayer.id && !isBotPlayerState(player)
+      );
       if (others.length && typeof this.playroom.transferHost === "function") {
         try {
           await this.playroom.transferHost(others[0].id);
@@ -636,8 +896,51 @@ class PlayroomRoomService {
       .filter(Boolean);
   }
 
+  getHumanRecords(now = Date.now()) {
+    return this.getLiveRecords().filter((record) => {
+      if (record.isBot || record.alive === false) {
+        return false;
+      }
+
+      const cloaked = (record.effects?.cloakUntil || 0) > now;
+      const revealed = (record.effects?.revealedUntil || 0) > now;
+      return !cloaked || revealed;
+    });
+  }
+
   getScoreboardRecords() {
     return this.getLiveRecords().sort(comparePlayersForScore);
+  }
+
+  getActorMoveSpeed(record, now) {
+    const loadout = getLoadout(record.loadoutId);
+    let speed = loadout.moveSpeed;
+
+    if ((record.effects?.overclockUntil || 0) > now) {
+      speed *= 1.22;
+    }
+
+    if ((record.effects?.cloakUntil || 0) > now) {
+      speed *= 1.12;
+    }
+
+    if ((record.effects?.slowedUntil || 0) > now) {
+      speed *= 0.68;
+    }
+
+    return speed;
+  }
+
+  getPrimaryRange(loadout) {
+    if (loadout.primary?.range) {
+      return loadout.primary.range;
+    }
+
+    if (loadout.primary?.speed && loadout.primary?.lifetime) {
+      return loadout.primary.speed * loadout.primary.lifetime;
+    }
+
+    return 520;
   }
 
   findRespawnPoint(playerId, now) {
@@ -661,13 +964,7 @@ class PlayroomRoomService {
       return existing;
     }
 
-    const initial = {
-      nextPrimaryAt: 0,
-      cooldowns: { Q: 0, E: 0, R: 0 },
-      lastSeq: 0,
-      stormCarry: 0,
-      respawnQueuedAt: 0,
-    };
+    const initial = createAuthorityState(this.getProfileState(playerId).loadoutId);
     this.authority.players.set(playerId, initial);
     return initial;
   }
@@ -866,17 +1163,22 @@ class PlayroomRoomService {
         break;
       case "tempest:E":
         {
-          const effectId = uid("mine_");
+          const mineTarget = {
+            x: clamp(action.targetX ?? actor.x + Math.cos(actor.aim) * 180, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(action.targetY ?? actor.y + Math.sin(actor.aim) * 180, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+          };
+          const effectId = typeof action.effectId === "string" && action.effectId ? action.effectId : uid("mine_");
           this.authority.effects.set(uid("fx_"), {
             id: effectId,
             type: "mine",
             ownerId: actor.id,
-            x: actor.x,
-            y: actor.y,
-            radius: 88,
-            armedAt: now + 400,
-            expiresAt: now + 7000,
-            damage: 34,
+            x: mineTarget.x,
+            y: mineTarget.y,
+            radius: PULSE_MINE_DAMAGE_RADIUS,
+            triggerRadius: PULSE_MINE_TRIGGER_RADIUS,
+            armedAt: now + PULSE_MINE_ARM_MS,
+            expiresAt: now + PULSE_MINE_LIFETIME_MS,
+            damage: PULSE_MINE_DAMAGE,
             color: loadout.theme,
           });
           this.enqueueEvent({
@@ -884,12 +1186,15 @@ class PlayroomRoomService {
             effectId,
             ownerId: actor.id,
             loadoutId: loadout.id,
-            x: actor.x,
-            y: actor.y,
-            radius: 88,
-            armedAt: now + 400,
-            expiresAt: now + 7000,
-            damage: 34,
+            x: mineTarget.x,
+            y: mineTarget.y,
+            fromX: actor.x,
+            fromY: actor.y,
+            radius: PULSE_MINE_DAMAGE_RADIUS,
+            triggerRadius: PULSE_MINE_TRIGGER_RADIUS,
+            armedAt: now + PULSE_MINE_ARM_MS,
+            expiresAt: now + PULSE_MINE_LIFETIME_MS,
+            damage: PULSE_MINE_DAMAGE,
             color: loadout.theme,
           });
         }
@@ -1428,7 +1733,10 @@ class PlayroomRoomService {
       }
     });
 
+    this.assignRoomPlayerSlots();
+
     if (this.matchState.state === "running") {
+      this.updatePracticeBots(now);
       this.simulateProjectiles(now);
       this.simulateEffects(now);
       this.applyStormDamage(now);
@@ -1511,8 +1819,14 @@ class PlayroomRoomService {
       }
 
       if (effect.type === "mine" && now >= effect.armedAt) {
-        const victims = this.getTargetsInRadius(effect.x, effect.y, effect.radius, effect.ownerId);
-        if (victims.length) {
+        const triggerVictim = this.getTargetsInRadius(
+          effect.x,
+          effect.y,
+          effect.triggerRadius || effect.radius,
+          effect.ownerId
+        )[0];
+        if (triggerVictim) {
+          const victims = this.getTargetsInRadius(effect.x, effect.y, effect.radius, effect.ownerId);
           this.enqueueEvent({
             type: "mine-detonate",
             effectId: effect.id,
@@ -1520,10 +1834,11 @@ class PlayroomRoomService {
             x: effect.x,
             y: effect.y,
             radius: effect.radius,
+            triggerRadius: effect.triggerRadius || null,
             color: effect.color,
           });
+          this.applyTimedEffect(triggerVictim.id, "slowedUntil", now + MINE_SLOW_DURATION_MS);
           victims.forEach((target) => {
-            this.applyTimedEffect(target.id, "slowedUntil", now + MINE_SLOW_DURATION_MS);
             this.applyDamage(target.id, effect.damage, effect.ownerId, "Pulse Mine");
           });
           this.authority.effects.delete(effectId);
@@ -1639,6 +1954,165 @@ class PlayroomRoomService {
     this.matchState.revision += 1;
     this.pendingMatchSync = true;
   }
+
+  updatePracticeBots(now) {
+    const targets = this.getHumanRecords(now);
+    if (!targets.length) {
+      return;
+    }
+
+    const storm =
+      this.matchState.startedAt && this.matchState.seed
+        ? getStormState(this.matchState.startedAt, this.matchState.seed, now)
+        : null;
+    const mineAttractors = Array.from(this.authority.effects.values()).filter(
+      (effect) => effect?.type === "mine" && (effect.expiresAt || 0) > now
+    );
+
+    this.getLiveRecords()
+      .filter((record) => record.isBot && record.alive !== false)
+      .forEach((bot) => {
+        const authority = this.ensureAuthorityPlayer(bot.id);
+        const loadout = getLoadout(bot.loadoutId);
+        const target = targets
+          .map((candidate) => ({
+            ...candidate,
+            distance: Math.hypot(candidate.x - bot.x, candidate.y - bot.y),
+          }))
+          .sort((left, right) => left.distance - right.distance)[0];
+
+        if (!target) {
+          return;
+        }
+
+        const angleToTarget = Math.atan2(target.y - bot.y, target.x - bot.x);
+
+        if (now >= (authority.botNextDecisionAt || 0)) {
+          authority.botNextDecisionAt =
+            now + BOT_DECISION_MIN_MS + Math.random() * BOT_DECISION_JITTER_MS;
+          authority.botStrafeDirection = Math.random() < 0.5 ? -1 : 1;
+          authority.botPreferredRange =
+            (BOT_PREFERRED_RANGE[loadout.id] || 340) * (0.9 + Math.random() * 0.26);
+          authority.botWanderAngle =
+            angleToTarget + authority.botStrafeDirection * (0.62 + Math.random() * 0.44);
+          if (now >= (authority.botPauseUntil || 0)) {
+            scheduleBotFireWindow(authority, now);
+          }
+        }
+
+        if (now >= (authority.botPauseUntil || 0) && now > (authority.botBurstUntil || 0)) {
+          scheduleBotFireWindow(authority, now);
+        }
+
+        const preferredRange = authority.botPreferredRange || BOT_PREFERRED_RANGE[loadout.id] || 340;
+        const retreatPad = loadout.id === "ember" ? 30 : 55;
+        const chasePad = loadout.id === "phantom" ? 110 : 80;
+        const toTarget = normalize(target.x - bot.x, target.y - bot.y);
+        const strafe = {
+          x: -toTarget.y * authority.botStrafeDirection,
+          y: toTarget.x * authority.botStrafeDirection,
+        };
+        const nearestMine = mineAttractors
+          .filter((effect) => effect.ownerId !== bot.id)
+          .map((effect) => ({
+            effect,
+            distance: Math.hypot(effect.x - bot.x, effect.y - bot.y),
+          }))
+          .filter((entry) => entry.distance <= BOT_MINE_ATTRACTION_RADIUS)
+          .sort((left, right) => left.distance - right.distance)[0];
+
+        let moveX = strafe.x * 0.74;
+        let moveY = strafe.y * 0.74;
+
+        if (target.distance > preferredRange + chasePad) {
+          moveX += toTarget.x * 1.28;
+          moveY += toTarget.y * 1.28;
+        } else if (target.distance < preferredRange - retreatPad) {
+          moveX -= toTarget.x * 1.06;
+          moveY -= toTarget.y * 1.06;
+        } else {
+          moveX += toTarget.x * 0.24;
+          moveY += toTarget.y * 0.24;
+        }
+
+        if (authority.botWanderAngle) {
+          moveX += Math.cos(authority.botWanderAngle) * 0.42;
+          moveY += Math.sin(authority.botWanderAngle) * 0.42;
+        }
+
+        if (nearestMine) {
+          const toMine = normalize(nearestMine.effect.x - bot.x, nearestMine.effect.y - bot.y);
+          const minePull =
+            0.72 +
+            clamp(
+              (BOT_MINE_ATTRACTION_RADIUS - nearestMine.distance) / BOT_MINE_ATTRACTION_RADIUS,
+              0,
+              0.9
+            );
+          moveX += toMine.x * minePull;
+          moveY += toMine.y * minePull;
+        }
+
+        if (storm) {
+          const distanceToCenter = Math.hypot(bot.x - storm.center.x, bot.y - storm.center.y);
+          const safeRadius = Math.max(180, storm.radius - BOT_STORM_BUFFER);
+          const toCenter = normalize(storm.center.x - bot.x, storm.center.y - bot.y);
+
+          if (distanceToCenter > safeRadius) {
+            const urgency = 1.24 + clamp((distanceToCenter - safeRadius) / 180, 0, 1.4);
+            moveX += toCenter.x * urgency * 1.34;
+            moveY += toCenter.y * urgency * 1.34;
+          } else if (distanceToCenter > safeRadius * 0.82) {
+            moveX += toCenter.x * 0.52;
+            moveY += toCenter.y * 0.52;
+          }
+        }
+
+        const movement = normalize(moveX, moveY);
+        const step = this.getActorMoveSpeed(bot, now) * 0.84 * (HOST_TICK_MS / 1000);
+        const aimOffset =
+          loadout.id === "ember"
+            ? (Math.random() - 0.5) * 0.14
+            : loadout.id === "phantom"
+              ? (Math.random() - 0.5) * 0.04
+              : (Math.random() - 0.5) * 0.08;
+        const reliablePose = now >= (authority.botReliablePoseAt || 0);
+        if (reliablePose) {
+          authority.botReliablePoseAt = now + BOT_POSE_RELIABLE_INTERVAL_MS;
+        }
+        const nextPose = this.setPoseState(
+          bot.id,
+          {
+            x: clamp(bot.x + movement.x * step, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(bot.y + movement.y * step, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            aim: wrapAngle(angleToTarget + aimOffset),
+          },
+          reliablePose
+        );
+
+        const botActor = {
+          ...bot,
+          x: nextPose?.x ?? bot.x,
+          y: nextPose?.y ?? bot.y,
+          aim: nextPose?.aim ?? angleToTarget,
+        };
+        const aimError = Math.abs(wrapAngle(angleToTarget - botActor.aim));
+        const range = this.getPrimaryRange(loadout);
+        const firingWindowOpen = now <= (authority.botBurstUntil || 0);
+        const shouldFire =
+          firingWindowOpen &&
+          target.distance <= range * 0.92 &&
+          aimError <= 0.24 &&
+          (target.distance <= preferredRange + 170 || target.distance <= range * 0.68);
+
+        if (shouldFire) {
+          this.processPrimaryAction(botActor, authority, {
+            kind: "primary",
+            createdAt: now,
+          });
+        }
+      });
+  }
 }
 
 class MissingConfigService {
@@ -1680,6 +2154,18 @@ class MissingConfigService {
 
   async startMatch() {
     throw new Error("Configure o Playroom para iniciar a partida online.");
+  }
+
+  async startSoloPractice() {
+    throw new Error("Configure o Playroom para iniciar a sala solo.");
+  }
+
+  async endMatch() {
+    throw new Error("Configure o Playroom para encerrar a partida.");
+  }
+
+  async transferLeadership() {
+    throw new Error("Configure o Playroom para transferir a lideranca.");
   }
 
   async leaveRoom() {}
