@@ -29,6 +29,9 @@ const refs = {
   shieldBar: document.getElementById("shieldBar"),
   shieldLabel: document.getElementById("shieldLabel"),
   abilityBar: document.getElementById("abilityBar"),
+  abilityTooltip: document.getElementById("abilityTooltip"),
+  hudDetails: document.getElementById("hudDetails"),
+  statusGrid: document.getElementById("statusGrid"),
   killFeed: document.getElementById("killFeed"),
   scoreboard: document.getElementById("scoreboard"),
   stormReadout: document.getElementById("stormReadout"),
@@ -73,7 +76,7 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-refs.playerName.value = window.localStorage.getItem("last-zone-player-name") || "SakaPilot";
+refs.playerName.value = "Player";
 refs.selectedWeaponBadge.textContent = getLoadout(state.selectedLoadoutId).name;
 refs.practiceButton.textContent = descriptor.mode === "playroom" ? "Sala Solo Instantanea" : "Playroom Indisponivel";
 
@@ -85,6 +88,9 @@ const game = new BattleRoyaleGame({
     shieldBar: refs.shieldBar,
     shieldLabel: refs.shieldLabel,
     abilityBar: refs.abilityBar,
+    abilityTooltip: refs.abilityTooltip,
+    hudDetails: refs.hudDetails,
+    statusGrid: refs.statusGrid,
     killFeed: refs.killFeed,
     scoreboard: refs.scoreboard,
     stormReadout: refs.stormReadout,
@@ -116,10 +122,18 @@ const game = new BattleRoyaleGame({
   },
 });
 
-function currentProfile() {
+function currentProfile({ customName = true } = {}) {
   const loadout = getLoadout(state.selectedLoadoutId);
+  const trimmedName = refs.playerName.value.trim().slice(0, 18);
+  const localRecord = state.snapshot?.players?.[state.snapshot?.localPlayerId] || null;
+  const assignedAutoName =
+    localRecord?.slotNumber > 0 ? `Player ${localRecord.slotNumber}` : localRecord?.name || "Player";
+  const followsAssignedAutoName =
+    customName && Boolean(trimmedName) && trimmedName === assignedAutoName && localRecord?.nameCustomized === false;
+  const nameCustomized = customName && Boolean(trimmedName) && !followsAssignedAutoName;
   return {
-    name: refs.playerName.value.trim() || "Piloto",
+    name: nameCustomized ? trimmedName : "",
+    nameCustomized,
     loadoutId: state.selectedLoadoutId,
     color: loadout.theme,
   };
@@ -140,7 +154,7 @@ function setNotice(message, isError = false) {
 }
 
 function isMatchActive(snapshot) {
-  return snapshot?.meta?.state === "running" || snapshot?.meta?.state === "ended";
+  return snapshot?.meta?.state === "running";
 }
 
 function currentMatchKey(snapshot) {
@@ -269,11 +283,18 @@ function renderPlayerList(snapshot) {
     ? players
         .map((player) => {
           const loadout = getLoadout(player.loadoutId || LOADOUTS[0].id);
-          const stateTag = snapshot.meta.hostId === player.id ? "Host" : player.alive === false ? "Eliminado" : "Online";
+          const inMatch = snapshot.meta?.state === "running";
+          const stateTag = player.isBot
+            ? "Bot"
+            : snapshot.meta.hostId === player.id
+              ? "Host"
+              : inMatch && player.alive === false
+                ? "Eliminado"
+                : "Na sala";
           return `
             <article class="player-chip">
               <div>
-                <strong>${escapeHtml(player.name || "Piloto")}</strong>
+                <strong>${escapeHtml(player.name || "Player")}</strong>
                 <small>${loadout.name} // ${player.kills || 0}K ${player.deaths || 0}D</small>
               </div>
               <small>${stateTag}</small>
@@ -289,25 +310,27 @@ function renderPlayerList(snapshot) {
 function updateButtons(snapshot) {
   const hasRoom = Boolean(snapshot.roomId);
   const running = snapshot.meta?.state === "running";
+  const playerCount = Object.keys(snapshot.players || {}).length;
+  const canStartSolo =
+    descriptor.mode === "playroom" && !running && playerCount <= 1 && (!hasRoom || snapshot.isHost);
   refs.copyRoomButton.disabled = !hasRoom;
   refs.leaveRoomButton.disabled = !hasRoom;
   refs.startMatchButton.disabled = !hasRoom || running || !snapshot.isHost;
-  refs.practiceButton.disabled = descriptor.mode !== "playroom";
+  refs.practiceButton.disabled = !canStartSolo;
   refs.createRoomButton.disabled = hasRoom;
   refs.joinRoomButton.disabled = hasRoom;
   refs.roomCodeInput.disabled = hasRoom;
 }
 
 async function syncLobbyProfile() {
-  window.localStorage.setItem("last-zone-player-name", refs.playerName.value.trim() || "Piloto");
-  game.setPlayerName(refs.playerName.value.trim() || "Piloto");
+  game.setPlayerName(refs.playerName.value.trim() || "Player");
 
   if (!state.snapshot?.roomId) {
     return;
   }
 
   try {
-    await roomService.updateLobbyProfile(currentProfile());
+    await roomService.updateLobbyProfile(currentProfile({ customName: true }));
   } catch (error) {
     setNotice(error.message, true);
   }
@@ -316,7 +339,7 @@ async function syncLobbyProfile() {
 async function createRoom() {
   try {
     await audio.boot();
-    await roomService.createRoom(currentProfile());
+    await roomService.createRoom(currentProfile({ customName: false }));
     setNotice("Sala criada. Compartilhe o codigo e aguarde ate 10 jogadores.");
     audio.play("join");
   } catch (error) {
@@ -333,7 +356,7 @@ async function joinRoom() {
 
   try {
     await audio.boot();
-    await roomService.joinRoom(roomCode, currentProfile());
+    await roomService.joinRoom(roomCode, currentProfile({ customName: false }));
     setNotice("Voce entrou na sala. Aguarde o host iniciar a partida.");
     audio.play("join");
   } catch (error) {
@@ -355,10 +378,24 @@ async function startMatch() {
 async function startSoloRoom() {
   try {
     await audio.boot();
-    await roomService.createRoom(currentProfile());
+    const playerCount = Object.keys(state.snapshot?.players || {}).length;
+    if (playerCount > 1) {
+      setNotice("A sala solo so pode ser aberta quando voce estiver sozinho.", true);
+      return;
+    }
+
+    if (state.snapshot?.roomId && !state.snapshot?.isHost) {
+      setNotice("Voce precisa ser o host para abrir a sala solo.", true);
+      return;
+    }
+
+    if (!state.snapshot?.roomId) {
+      await roomService.createRoom(currentProfile({ customName: false }));
+    }
+
     const seed = Date.now() ^ seedFromText(`solo-${state.selectedLoadoutId}`);
-    await roomService.startMatch(seed);
-    setNotice("Sala solo criada. A arena 3D foi iniciada com respawn e placar ativos.");
+    await roomService.startSoloPractice(seed);
+    setNotice("Sala solo criada. Um bot de treino entrou e a partida foi iniciada.");
   } catch (error) {
     setNotice(error.message, true);
   }
@@ -405,6 +442,7 @@ document.addEventListener("pointerdown", () => {
 
 roomService.subscribe((snapshot) => {
   state.snapshot = snapshot;
+  const localRecord = snapshot.players?.[snapshot.localPlayerId] || null;
 
   if (snapshot.roomId) {
     refs.roomCodeInput.value = snapshot.roomId;
@@ -412,9 +450,13 @@ roomService.subscribe((snapshot) => {
     refs.roomCodeInput.value = "";
   }
 
+  if (localRecord?.name && document.activeElement !== refs.playerName) {
+    refs.playerName.value = localRecord.name;
+  }
+
   renderPlayerList(snapshot);
   updateButtons(snapshot);
-  game.setPlayerName(refs.playerName.value.trim() || "Piloto");
+  game.setPlayerName(refs.playerName.value.trim() || "Player");
   game.setSelectedLoadout(state.selectedLoadoutId);
   game.setSnapshot(snapshot);
   syncGameView(snapshot);
