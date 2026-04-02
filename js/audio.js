@@ -3,6 +3,7 @@ export class AudioEngine {
     this.context = null;
     this.masterGain = null;
     this.noiseBuffer = null;
+    this.effectsVolume = this.readStoredEffectsVolume();
   }
 
   async boot() {
@@ -14,7 +15,7 @@ export class AudioEngine {
       const Context = window.AudioContext || window.webkitAudioContext;
       this.context = new Context();
       this.masterGain = this.context.createGain();
-      this.masterGain.gain.value = 0.32;
+      this.applyEffectsVolume();
       this.masterGain.connect(this.context.destination);
       this.noiseBuffer = this.createNoiseBuffer();
     }
@@ -22,6 +23,43 @@ export class AudioEngine {
     if (this.context.state === "suspended") {
       await this.context.resume();
     }
+  }
+
+  readStoredEffectsVolume() {
+    try {
+      const stored = window.localStorage?.getItem("last-zone-effects-volume");
+      const parsed = Number(stored);
+      if (Number.isFinite(parsed)) {
+        return Math.max(0, Math.min(1, parsed));
+      }
+    } catch {
+      // Ignora falhas de acesso ao storage.
+    }
+
+    return 1;
+  }
+
+  applyEffectsVolume() {
+    if (!this.masterGain) {
+      return;
+    }
+
+    this.masterGain.gain.value = 0.32 * this.effectsVolume;
+  }
+
+  setEffectsVolume(value) {
+    this.effectsVolume = Math.max(0, Math.min(1, Number(value) || 0));
+    this.applyEffectsVolume();
+
+    try {
+      window.localStorage?.setItem("last-zone-effects-volume", String(this.effectsVolume));
+    } catch {
+      // Ignora falhas de persistencia.
+    }
+  }
+
+  getEffectsVolume() {
+    return this.effectsVolume;
   }
 
   createNoiseBuffer() {
