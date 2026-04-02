@@ -14,7 +14,7 @@ export const LOADOUTS = [
     accent: "#1a5447",
     summary: "Pressao movel, rajadas constantes e controle de espaco.",
     moveSpeed: 236,
-    maxHealth: 100,
+    maxHealth: 201,
     maxShield: 45,
     primary: {
       label: "Rifle ciclico",
@@ -39,8 +39,9 @@ export const LOADOUTS = [
         slot: "E",
         id: "pulse-mine",
         name: "Pulse Mine",
-        cooldown: 10500,
-        summary: "Lanca uma mina EMP que explode ao toque e desacelera quem entrar.",
+        cooldown: 15000,
+        damageLabel: "34 dano",
+        summary: "Arremessa uma mina na mira; ela detona por proximidade, causa dano em area e desacelera quem a aciona.",
       },
       {
         slot: "R",
@@ -58,7 +59,7 @@ export const LOADOUTS = [
     accent: "#6b3116",
     summary: "Entrada agressiva, burst de perto e protecao para briga curta.",
     moveSpeed: 228,
-    maxHealth: 112,
+    maxHealth: 201,
     maxShield: 35,
     primary: {
       label: "Escopeta vulcanica",
@@ -76,6 +77,7 @@ export const LOADOUTS = [
         id: "breach-slam",
         name: "Breach Slam",
         cooldown: 8000,
+        damageLabel: "24 dano",
         summary: "Salto ofensivo com impacto em area no ponto de chegada.",
       },
       {
@@ -90,6 +92,7 @@ export const LOADOUTS = [
         id: "dragon-roar",
         name: "Dragon Roar",
         cooldown: 17500,
+        damageLabel: "30 dano",
         summary: "Sopro de fogo em cone que castiga inimigos muito proximos.",
       },
     ],
@@ -101,7 +104,7 @@ export const LOADOUTS = [
     accent: "#274c69",
     summary: "Picks precisos, reposicionamento furtivo e leitura de terreno.",
     moveSpeed: 232,
-    maxHealth: 94,
+    maxHealth: 201,
     maxShield: 42,
     primary: {
       label: "Tiro de precisao",
@@ -131,6 +134,7 @@ export const LOADOUTS = [
         id: "pierce-line",
         name: "Pierce Line",
         cooldown: 18500,
+        damageLabel: "46 dano",
         summary: "Disparo atravessante em linha reta com alto dano.",
       },
     ],
@@ -142,7 +146,7 @@ export const LOADOUTS = [
     accent: "#66550d",
     summary: "Zona eletrica, explosoes lentas e controle de terreno.",
     moveSpeed: 224,
-    maxHealth: 105,
+    maxHealth: 201,
     maxShield: 40,
     primary: {
       label: "Orbe de impacto",
@@ -161,6 +165,7 @@ export const LOADOUTS = [
         id: "arc-dash",
         name: "Arc Dash",
         cooldown: 9000,
+        damageLabel: "22 dano",
         summary: "Dash energizado que solta correntes para alvos proximos no fim.",
       },
       {
@@ -175,6 +180,7 @@ export const LOADOUTS = [
         id: "storm-core",
         name: "Storm Core",
         cooldown: 19000,
+        damageLabel: "13 / pulso",
         summary: "Nucleo tempestuoso em area com pulsos sucessivos de dano.",
       },
     ],
