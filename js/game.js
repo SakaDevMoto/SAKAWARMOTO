@@ -19,6 +19,9 @@ const PLAYER_Y = 18;
 const CAMERA_HEIGHT = 620;
 const CAMERA_DISTANCE = 500;
 const CAMERA_LOOK_HEIGHT = 24;
+const DEFAULT_FIELD_OF_VIEW = 52;
+const MIN_FIELD_OF_VIEW = 34;
+const MAX_FIELD_OF_VIEW = 88;
 const GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
 function disposeMaterial(material) {
@@ -72,6 +75,45 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function renderAbilityIconSvg(ability) {
+  switch (ability?.id) {
+    case "flash-step":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 12h8"></path>
+          <path d="M9 7l5 5-5 5"></path>
+          <path d="M15 7h5"></path>
+          <path d="M17 17h3"></path>
+        </svg>
+      `;
+    case "pulse-mine":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="3.5"></circle>
+          <circle cx="12" cy="12" r="7.5"></circle>
+          <path d="M12 2.5v3"></path>
+          <path d="M12 18.5v3"></path>
+          <path d="M2.5 12h3"></path>
+          <path d="M18.5 12h3"></path>
+        </svg>
+      `;
+    case "overclock":
+      return `
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M13 2 6 13h5l-1 9 8-12h-5z"></path>
+          <path d="M4 5l2 2"></path>
+          <path d="M18 17l2 2"></path>
+        </svg>
+      `;
+    default:
+      return "";
+  }
+}
+
+function resolvePlayerColor(player, fallback = "#5ff3d6") {
+  return player?.color || fallback;
+}
+
 function isEditableTarget(target) {
   const tagName = target?.tagName?.toUpperCase?.() || "";
   return Boolean(target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(tagName));
@@ -103,7 +145,7 @@ export class BattleRoyaleGame {
       networkMode: "missing",
     };
 
-    this.playerName = "Piloto";
+    this.playerName = "Player";
     this.selectedLoadoutId = LOADOUTS[0].id;
     this.localPose = {
       x: WORLD_SIZE / 2,
@@ -122,6 +164,7 @@ export class BattleRoyaleGame {
     this.damageNumbers = [];
     this.processedEvents = new Set();
     this.processedQueue = [];
+    this.statusTrailAt = new Map();
     this.currentMatchKey = null;
     this.actionSeq = 0;
     this.lastPosePushAt = 0;
@@ -133,6 +176,8 @@ export class BattleRoyaleGame {
       E: 0,
       R: 0,
     };
+    this.showMatchDetails = false;
+    this.menuOpen = false;
 
     this.keys = new Set();
     this.justPressed = new Set();
@@ -145,15 +190,28 @@ export class BattleRoyaleGame {
 
     this.mobile = {
       enabled: window.matchMedia(MOBILE_QUERY).matches,
-      move: { pointerId: null, x: 0, y: 0 },
-      aim: { pointerId: null, x: 0, y: 0, active: false },
+      move: { pointerId: null, x: 0, y: 0, anchorClientX: 0, anchorClientY: 0 },
+      aim: { pointerId: null, x: 0, y: 0, active: false, anchorClientX: 0, anchorClientY: 0 },
+      manualFire: false,
       fire: false,
+      abilityTarget: {
+        active: false,
+        pointerId: null,
+        slot: null,
+        effectId: null,
+        previewKey: null,
+        target: null,
+        startClientX: 0,
+        startClientY: 0,
+        startWorld: null,
+      },
     };
 
     this.camera = {
       x: WORLD_SIZE / 2,
       y: WORLD_SIZE / 2,
     };
+    this.fieldOfView = DEFAULT_FIELD_OF_VIEW;
 
     this.pointerNdc = new THREE.Vector2();
     this.raycaster = new THREE.Raycaster();
@@ -172,7 +230,7 @@ export class BattleRoyaleGame {
     this.scene.background = new THREE.Color("#050d15");
     this.scene.fog = new THREE.Fog("#06111b", 850, 3600);
 
-    this.camera3D = new THREE.PerspectiveCamera(52, 16 / 9, 1, 5200);
+    this.camera3D = new THREE.PerspectiveCamera(this.fieldOfView, 16 / 9, 1, 5200);
     this.worldRoot = new THREE.Group();
     this.fxRoot = new THREE.Group();
     this.scene.add(this.worldRoot);
@@ -182,6 +240,7 @@ export class BattleRoyaleGame {
     this.syncRendererSize();
     this.bindInput();
     this.bindMobileControls();
+    this.bindAbilityUi();
     this.refreshAbilityBar();
     this.loop = this.loop.bind(this);
     window.requestAnimationFrame(this.loop);
@@ -359,6 +418,7 @@ export class BattleRoyaleGame {
         transparent: true,
         opacity: 0.11,
         side: THREE.DoubleSide,
+        depthWrite: false,
       })
     );
     wall.position.y = 120;
@@ -369,6 +429,7 @@ export class BattleRoyaleGame {
         color: "#ffd166",
         transparent: true,
         opacity: 0.9,
+        depthWrite: false,
       })
     );
     edge.rotation.x = Math.PI / 2;
@@ -381,6 +442,7 @@ export class BattleRoyaleGame {
         transparent: true,
         opacity: 0.2,
         side: THREE.DoubleSide,
+        depthWrite: false,
       })
     );
     halo.rotation.x = -Math.PI / 2;
@@ -443,6 +505,14 @@ export class BattleRoyaleGame {
         return;
       }
 
+      if (event.code === "Tab") {
+        if (this.snapshot.meta?.state === "running" || this.snapshot.meta?.state === "ended") {
+          event.preventDefault();
+          this.showMatchDetails = true;
+        }
+        return;
+      }
+
       const isGameplayKey = ["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE", "KeyR", "Enter"].includes(event.code);
       if (isGameplayKey && this.snapshot.meta?.state === "running") {
         event.preventDefault();
@@ -457,17 +527,17 @@ export class BattleRoyaleGame {
     });
 
     window.addEventListener("keyup", (event) => {
+      if (event.code === "Tab") {
+        this.showMatchDetails = false;
+        return;
+      }
       this.keys.delete(event.code);
     });
 
     window.addEventListener("blur", () => {
-      this.mouse.down = false;
-      this.mouse.inside = false;
-      this.mobile.fire = false;
-      this.resetJoystick(this.mobile.move, this.ui.moveStick);
-      this.resetJoystick(this.mobile.aim, this.ui.aimStick, true);
-      this.keys.clear();
-      this.justPressed.clear();
+      this.clearControlState();
+      this.showMatchDetails = false;
+      this.hideAbilityTooltip();
     });
 
     window.addEventListener("resize", () => {
@@ -486,68 +556,127 @@ export class BattleRoyaleGame {
   }
 
   bindMobileControls() {
-    if (!this.ui.movePad || !this.ui.aimPad) {
+    if (!this.ui.mobileControls || !this.ui.movePad || !this.ui.aimPad) {
       return;
     }
 
-    const bindStick = (pad, stick, state, isAim = false) => {
-      const updateStick = (event) => {
-        if (state.pointerId !== event.pointerId) {
-          return;
-        }
+    const container = this.ui.mobileControls;
 
-        const bounds = pad.getBoundingClientRect();
-        const centerX = bounds.left + bounds.width * 0.5;
-        const centerY = bounds.top + bounds.height * 0.5;
-        const dx = event.clientX - centerX;
-        const dy = event.clientY - centerY;
-        const radius = Math.max(20, Math.min(bounds.width, bounds.height) * 0.34);
-        const distance = Math.min(radius, Math.hypot(dx, dy) || 0);
-        const angle = Math.atan2(dy, dx);
-        const offsetX = Math.cos(angle) * distance;
-        const offsetY = Math.sin(angle) * distance;
-
-        state.x = clamp(offsetX / radius, -1, 1);
-        state.y = clamp(offsetY / radius, -1, 1);
-        if (isAim) {
-          state.active = Math.hypot(state.x, state.y) > 0.18;
-        }
-
-        if (stick) {
-          stick.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
-        }
+    const placeStick = (pad, event) => {
+      const bounds = container.getBoundingClientRect();
+      const padWidth = pad.offsetWidth || 124;
+      const padHeight = pad.offsetHeight || padWidth;
+      const halfWidth = padWidth * 0.5;
+      const halfHeight = padHeight * 0.5;
+      const localX = clamp(event.clientX - bounds.left, halfWidth + 4, bounds.width - halfWidth - 4);
+      const localY = clamp(event.clientY - bounds.top, halfHeight + 4, bounds.height - halfHeight - 4);
+      pad.style.left = `${localX - halfWidth}px`;
+      pad.style.top = `${localY - halfHeight}px`;
+      pad.classList.add("is-visible");
+      return {
+        anchorClientX: bounds.left + localX,
+        anchorClientY: bounds.top + localY,
       };
-
-      pad.addEventListener("pointerdown", async (event) => {
-        if (!this.mobile.enabled || state.pointerId !== null) {
-          return;
-        }
-
-        event.preventDefault();
-        state.pointerId = event.pointerId;
-        pad.setPointerCapture?.(event.pointerId);
-        await this.audio.boot();
-        updateStick(event);
-      });
-
-      pad.addEventListener("pointermove", (event) => {
-        updateStick(event);
-      });
-
-      const releaseStick = (event) => {
-        if (state.pointerId !== event.pointerId) {
-          return;
-        }
-        this.resetJoystick(state, stick, isAim);
-      };
-
-      pad.addEventListener("pointerup", releaseStick);
-      pad.addEventListener("pointercancel", releaseStick);
-      pad.addEventListener("lostpointercapture", releaseStick);
     };
 
-    bindStick(this.ui.movePad, this.ui.moveStick, this.mobile.move);
-    bindStick(this.ui.aimPad, this.ui.aimStick, this.mobile.aim, true);
+    const updateStick = (event, stick, state, isAim = false) => {
+      if (state.pointerId !== event.pointerId) {
+        return;
+      }
+
+      const padSize = stick?.parentElement?.offsetWidth || 124;
+      const radius = Math.max(20, padSize * 0.34);
+      const dx = event.clientX - (state.anchorClientX || event.clientX);
+      const dy = event.clientY - (state.anchorClientY || event.clientY);
+      const distance = Math.min(radius, Math.hypot(dx, dy) || 0);
+      const angle = Math.atan2(dy, dx);
+      const offsetX = Math.cos(angle) * distance;
+      const offsetY = Math.sin(angle) * distance;
+
+      state.x = clamp(offsetX / radius, -1, 1);
+      state.y = clamp(offsetY / radius, -1, 1);
+      if (isAim) {
+        state.active = Math.hypot(state.x, state.y) > 0.16;
+        this.syncMobileFireState();
+      }
+
+      if (stick) {
+        stick.style.transform = `translate(calc(-50% + ${offsetX}px), calc(-50% + ${offsetY}px))`;
+      }
+    };
+
+    const activateStick = async (event, pad, stick, state, isAim = false) => {
+      if (!this.mobile.enabled || state.pointerId !== null) {
+        return false;
+      }
+
+      const anchor = placeStick(pad, event);
+      state.pointerId = event.pointerId;
+      state.anchorClientX = anchor.anchorClientX;
+      state.anchorClientY = anchor.anchorClientY;
+      await this.audio.boot();
+      updateStick(event, stick, state, isAim);
+      return true;
+    };
+
+    const releaseStick = (event, stick, state, isAim = false) => {
+      if (state.pointerId !== event.pointerId) {
+        return;
+      }
+      this.resetJoystick(state, stick, isAim);
+    };
+
+    container.addEventListener("pointerdown", async (event) => {
+      if (!this.mobile.enabled || event.pointerType !== "touch") {
+        return;
+      }
+      if (
+        event.target?.closest?.(".mobile-action") ||
+        event.target?.closest?.("#aimPad") ||
+        event.target?.closest?.(".mobile-menu-button")
+      ) {
+        return;
+      }
+
+      const bounds = container.getBoundingClientRect();
+      const localX = event.clientX - bounds.left;
+      const leftHalf = localX < bounds.width * 0.5;
+
+      event.preventDefault();
+      this.canvas.focus();
+
+      if (leftHalf) {
+        await activateStick(event, this.ui.movePad, this.ui.moveStick, this.mobile.move);
+      }
+    });
+
+    this.ui.aimPad.addEventListener("pointerdown", async (event) => {
+      if (!this.mobile.enabled || event.pointerType !== "touch" || this.mobile.aim.pointerId !== null) {
+        return;
+      }
+
+      event.preventDefault();
+      this.canvas.focus();
+      const bounds = this.ui.aimPad.getBoundingClientRect();
+      this.mobile.aim.pointerId = event.pointerId;
+      this.mobile.aim.anchorClientX = bounds.left + bounds.width * 0.5;
+      this.mobile.aim.anchorClientY = bounds.top + bounds.height * 0.5;
+      await this.audio.boot();
+      updateStick(event, this.ui.aimStick, this.mobile.aim, true);
+    });
+
+    window.addEventListener("pointermove", (event) => {
+      updateStick(event, this.ui.moveStick, this.mobile.move);
+      updateStick(event, this.ui.aimStick, this.mobile.aim, true);
+    });
+
+    const releaseDynamicSticks = (event) => {
+      releaseStick(event, this.ui.moveStick, this.mobile.move);
+      releaseStick(event, this.ui.aimStick, this.mobile.aim, true);
+    };
+
+    window.addEventListener("pointerup", releaseDynamicSticks);
+    window.addEventListener("pointercancel", releaseDynamicSticks);
 
     if (this.ui.mobileFireButton) {
       let firePointerId = null;
@@ -558,7 +687,8 @@ export class BattleRoyaleGame {
         event.preventDefault();
         firePointerId = event.pointerId;
         this.ui.mobileFireButton.setPointerCapture?.(event.pointerId);
-        this.mobile.fire = true;
+        this.mobile.manualFire = true;
+        this.syncMobileFireState();
         this.ui.mobileFireButton.classList.add("is-active");
         await this.audio.boot();
       };
@@ -567,7 +697,8 @@ export class BattleRoyaleGame {
           return;
         }
         firePointerId = null;
-        this.mobile.fire = false;
+        this.mobile.manualFire = false;
+        this.syncMobileFireState();
         this.ui.mobileFireButton.classList.remove("is-active");
       };
 
@@ -579,35 +710,306 @@ export class BattleRoyaleGame {
     }
 
     Object.entries(this.ui.mobileAbilityButtons || {}).forEach(([slot, button]) => {
-      const code = `Key${slot}`;
+      let activePointerId = null;
+      let holdTimer = null;
+      let showingTooltip = false;
+      let targeting = false;
+
+      const clearHold = () => {
+        if (holdTimer) {
+          window.clearTimeout(holdTimer);
+          holdTimer = null;
+        }
+      };
+
+      const currentLoadout = () => getLoadout(this.getLocalRecord()?.loadoutId || this.selectedLoadoutId);
+
+      const shouldStartPointTargeting = (event) => {
+        const loadout = currentLoadout();
+        if (!this.isPointTargetAbility(loadout.id, slot)) {
+          return false;
+        }
+
+        const bounds = button.getBoundingClientRect();
+        const outside =
+          event.clientX < bounds.left ||
+          event.clientX > bounds.right ||
+          event.clientY < bounds.top ||
+          event.clientY > bounds.bottom;
+        if (outside) {
+          return true;
+        }
+
+        const centerX = bounds.left + bounds.width * 0.5;
+        const centerY = bounds.top + bounds.height * 0.5;
+        return Math.hypot(event.clientX - centerX, event.clientY - centerY) > Math.min(bounds.width, bounds.height) * 0.52;
+      };
+
+      const startTargeting = (event) => {
+        const now = Date.now();
+        const localRecord = this.getLocalRecord();
+        const loadout = currentLoadout();
+        if (!localRecord || localRecord.alive === false || this.getAbilityCooldownRemaining(slot, now) > 0) {
+          return false;
+        }
+
+        targeting = true;
+        showingTooltip = false;
+        clearHold();
+        this.hideAbilityTooltip();
+        const startWorld = this.clientToWorld(event.clientX, event.clientY);
+        this.mobile.abilityTarget = {
+          active: true,
+          pointerId: event.pointerId,
+          slot,
+          effectId: `mobile_effect_${this.snapshot.localPlayerId || "player"}_${slot}_${this.actionSeq + 1}_${Math.round(now)}`,
+          previewKey: `mobile-target-${slot}`,
+          target: null,
+          startClientX: event.clientX,
+          startClientY: event.clientY,
+          startWorld,
+        };
+        button.classList.add("is-targeting");
+        this.syncMobileFireState();
+        this.updateMobileAbilityTarget(event, localRecord, loadout, slot);
+        return true;
+      };
+
       button.addEventListener("pointerdown", async (event) => {
         if (!this.mobile.enabled) {
           return;
         }
         event.preventDefault();
+        activePointerId = event.pointerId;
+        targeting = false;
+        showingTooltip = false;
         button.setPointerCapture?.(event.pointerId);
         button.classList.add("is-active");
-        this.justPressed.add(code);
         await this.audio.boot();
+        holdTimer = window.setTimeout(() => {
+          showingTooltip = true;
+          this.showAbilityTooltip(button);
+        }, 420);
       });
-      const clear = () => button.classList.remove("is-active");
-      button.addEventListener("pointerup", clear);
+
+      button.addEventListener("pointermove", (event) => {
+        if (activePointerId !== event.pointerId) {
+          return;
+        }
+
+        if (targeting) {
+          const localRecord = this.getLocalRecord();
+          if (!localRecord || localRecord.alive === false) {
+            return;
+          }
+          this.updateMobileAbilityTarget(event, localRecord, currentLoadout(), slot);
+          return;
+        }
+
+        if (shouldStartPointTargeting(event)) {
+          startTargeting(event);
+        }
+      });
+
+      const clear = (event, triggerAbility = false) => {
+        if (event && activePointerId !== null && event.pointerId !== activePointerId) {
+          return;
+        }
+        const targetState = this.mobile.abilityTarget;
+        const localRecord = this.getLocalRecord();
+        const targetedPoint =
+          targeting &&
+          targetState.active &&
+          targetState.pointerId === activePointerId &&
+          targetState.slot === slot &&
+          targetState.target;
+
+        clearHold();
+        if (triggerAbility && localRecord?.alive !== false) {
+          if (targetedPoint) {
+            this.castAbility(slot, Date.now(), localRecord, {
+              targetX: targetState.target.x,
+              targetY: targetState.target.y,
+              effectId: targetState.effectId,
+            });
+          } else if (!showingTooltip) {
+            this.castAbility(slot, Date.now(), localRecord);
+          }
+        }
+
+        showingTooltip = false;
+        targeting = false;
+        activePointerId = null;
+        button.classList.remove("is-active");
+        button.classList.remove("is-targeting");
+        this.hideAbilityTooltip();
+        this.clearMobileAbilityTargeting();
+      };
+
+      button.addEventListener("pointerup", (event) => clear(event, true));
       button.addEventListener("pointercancel", clear);
-      button.addEventListener("pointerleave", clear);
       button.addEventListener("lostpointercapture", clear);
     });
+  }
+
+  bindAbilityUi() {
+    if (!this.ui.abilityBar) {
+      return;
+    }
+
+    const resolveButton = (target) => target?.closest?.("[data-ability-slot]");
+
+    this.ui.abilityBar.addEventListener("pointerdown", (event) => {
+      const button = resolveButton(event.target);
+      if (!button) {
+        return;
+      }
+      event.preventDefault();
+      this.canvas.focus();
+    });
+
+    this.ui.abilityBar.addEventListener("pointerover", (event) => {
+      if (this.mobile.enabled) {
+        return;
+      }
+      const button = resolveButton(event.target);
+      if (!button) {
+        return;
+      }
+      this.showAbilityTooltip(button);
+    });
+
+    this.ui.abilityBar.addEventListener("pointermove", (event) => {
+      if (this.mobile.enabled) {
+        return;
+      }
+      const button = resolveButton(event.target);
+      if (!button) {
+        this.hideAbilityTooltip();
+        return;
+      }
+      this.showAbilityTooltip(button);
+    });
+
+    this.ui.abilityBar.addEventListener("pointerleave", () => {
+      this.hideAbilityTooltip();
+    });
+  }
+
+  showAbilityTooltip(target) {
+    if (!this.ui.abilityTooltip || !target) {
+      return;
+    }
+
+    const abilityName = target.dataset.abilityName || target.dataset.abilitySlot || "";
+    const abilityDetail = target.dataset.abilityDetail || "";
+    const abilityDamage = target.dataset.abilityDamage || "";
+    if (!abilityName && !abilityDetail) {
+      this.hideAbilityTooltip();
+      return;
+    }
+
+    this.ui.abilityTooltip.innerHTML = `
+      <div class="ability-tooltip__head">
+        <strong>${escapeHtml(abilityName)}</strong>
+        ${abilityDamage ? `<small class="ability-tooltip__damage">${escapeHtml(abilityDamage)}</small>` : ""}
+      </div>
+      <span>${escapeHtml(abilityDetail)}</span>
+    `;
+    this.ui.abilityTooltip.hidden = false;
+
+    const targetRect = target.getBoundingClientRect();
+    const tooltipRect = this.ui.abilityTooltip.getBoundingClientRect();
+    const left = clamp(
+      targetRect.left + targetRect.width * 0.5 - tooltipRect.width * 0.5,
+      12,
+      window.innerWidth - tooltipRect.width - 12
+    );
+    const top = Math.max(12, targetRect.top - tooltipRect.height - 12);
+    this.ui.abilityTooltip.style.left = `${left}px`;
+    this.ui.abilityTooltip.style.top = `${top}px`;
+  }
+
+  hideAbilityTooltip() {
+    if (!this.ui.abilityTooltip) {
+      return;
+    }
+    this.ui.abilityTooltip.hidden = true;
+  }
+
+  syncMobileFireState() {
+    const aimFiring =
+      this.mobile.enabled &&
+      this.mobile.aim.pointerId !== null &&
+      !this.mobile.abilityTarget.active &&
+      (this.mobile.aim.active || Math.hypot(this.mobile.aim.x, this.mobile.aim.y) > 0.12);
+    this.mobile.fire = Boolean(this.mobile.manualFire || aimFiring);
+  }
+
+  isPointTargetAbility(loadoutId, slot) {
+    return new Set(["tempest:E", "volt:E", "volt:R"]).has(`${loadoutId}:${slot}`);
+  }
+
+  getAbilityCooldownRemaining(slot, now = Date.now()) {
+    return Math.max(0, (this.localTimers[slot] || 0) - now);
+  }
+
+  disposeGroundEffect(effect) {
+    if (!effect?.group) {
+      return;
+    }
+    this.fxRoot.remove(effect.group);
+    disposeObject(effect.group);
+  }
+
+  clearMobileAbilityTargeting() {
+    this.groundEffects = this.groundEffects.filter((effect) => {
+      if (!effect?.previewKey || !String(effect.previewKey).startsWith("mobile-target-")) {
+        return true;
+      }
+      this.disposeGroundEffect(effect);
+      return false;
+    });
+    this.mobile.abilityTarget = {
+      active: false,
+      pointerId: null,
+      slot: null,
+      effectId: null,
+      previewKey: null,
+      target: null,
+      startClientX: 0,
+      startClientY: 0,
+      startWorld: null,
+    };
+    this.syncMobileFireState();
   }
 
   resetJoystick(state, stick, isAim = false) {
     state.pointerId = null;
     state.x = 0;
     state.y = 0;
+    state.anchorClientX = 0;
+    state.anchorClientY = 0;
     if (isAim) {
       state.active = false;
+      this.syncMobileFireState();
     }
+    stick?.parentElement?.classList.remove("is-visible");
     if (stick) {
       stick.style.transform = "translate(-50%, -50%)";
     }
+  }
+
+  clearControlState() {
+    this.mouse.down = false;
+    this.mouse.inside = false;
+    this.mobile.manualFire = false;
+    this.mobile.fire = false;
+    this.resetJoystick(this.mobile.move, this.ui.moveStick);
+    this.resetJoystick(this.mobile.aim, this.ui.aimStick, true);
+    this.clearMobileAbilityTargeting();
+    this.keys.clear();
+    this.justPressed.clear();
   }
 
   syncRendererSize() {
@@ -622,7 +1024,7 @@ export class BattleRoyaleGame {
   }
 
   setPlayerName(name) {
-    this.playerName = name || "Piloto";
+    this.playerName = name || "Player";
   }
 
   setSelectedLoadout(loadoutId) {
@@ -630,12 +1032,29 @@ export class BattleRoyaleGame {
     this.refreshAbilityBar();
   }
 
+  setFieldOfView(value) {
+    this.fieldOfView = clamp(Number(value) || DEFAULT_FIELD_OF_VIEW, MIN_FIELD_OF_VIEW, MAX_FIELD_OF_VIEW);
+    this.camera3D.fov = this.fieldOfView;
+    this.camera3D.updateProjectionMatrix();
+  }
+
+  getFieldOfView() {
+    return this.fieldOfView;
+  }
+
+  setMenuOpen(open) {
+    this.menuOpen = Boolean(open);
+    this.clearControlState();
+    this.showMatchDetails = false;
+    this.hideAbilityTooltip();
+  }
+
   setSnapshot(snapshot) {
     this.snapshot = snapshot;
     const localRecord = this.getLocalRecord();
 
     if (localRecord) {
-      this.selectedLoadoutId = localRecord.loadoutId || this.selectedLoadoutId;
+      this.selectedLoadoutId = getLoadout(localRecord.loadoutId || this.selectedLoadoutId).id;
       this.playerName = localRecord.name || this.playerName;
     }
 
@@ -663,6 +1082,8 @@ export class BattleRoyaleGame {
     this.processedEvents.clear();
     this.processedQueue = [];
     this.hitFlashes.clear();
+    this.showMatchDetails = false;
+    this.hideAbilityTooltip();
     this.localTimers = {
       primaryReadyAt: 0,
       Q: 0,
@@ -787,21 +1208,34 @@ export class BattleRoyaleGame {
   processEvent(event) {
     switch (event.type) {
       case "projectile":
+        if (event.ownerId === this.snapshot.localPlayerId) {
+          break;
+        }
         this.projectiles.push(this.createProjectileVisual(event));
+        this.spawnTinyDots(event.x, event.y, event.color, 2, 14, PLAYER_Y + 6);
         break;
       case "hitscan":
         this.beams.push(this.createBeamVisual(event.x, event.y, event.toX, event.toY, event.color, event.width || 4, 0.14));
+        this.spawnTinyDots(event.x, event.y, event.color, 2, 12, PLAYER_Y + 6);
+        this.spawnTinyDots(event.toX, event.toY, event.color, 2, 12, PLAYER_Y + 8);
         break;
       case "shotgun":
+        this.spawnTinyDots(event.x, event.y, event.color, 2, 12, PLAYER_Y + 6);
         (event.traces || []).forEach((trace) => {
           this.beams.push(this.createBeamVisual(event.x, event.y, trace.x, trace.y, event.color, 2.8, 0.1));
+          this.spawnTinyDots(trace.x, trace.y, event.color, 1, 10, PLAYER_Y + 7);
         });
         break;
       case "mine":
+        this.syncTempestMinePreview({
+          ...event,
+          type: "mine",
+        });
+        break;
       case "gravity":
       case "storm":
       case "recon":
-        this.groundEffects.push(this.createGroundEffectVisual(event));
+        this.syncPersistentGroundEffect(event);
         break;
       case "mine-detonate":
         this.retireGroundEffect(event.effectId, "mine");
@@ -935,13 +1369,13 @@ export class BattleRoyaleGame {
         const target =
           event.targetId === this.snapshot.localPlayerId
             ? this.playerName
-            : this.snapshot.players?.[event.targetId]?.name || "Piloto";
+            : this.snapshot.players?.[event.targetId]?.name || "Player";
         this.killFeed.unshift({
           id: event.id,
           text: `${attacker} eliminou ${target}`,
-          expiresAt: Date.now() + 5500,
+          expiresAt: Date.now() + 2800,
         });
-        this.killFeed = this.killFeed.slice(0, 5);
+        this.killFeed = this.killFeed.slice(0, 3);
         this.audio.play("elimination");
         break;
       }
@@ -1012,17 +1446,16 @@ export class BattleRoyaleGame {
   }
 
   createProjectileVisual(event) {
-    const radius = Math.max(3, event.radius || 4);
+    const radius = Math.max(0.95, Math.min(2.1, (event.radius || 4) * 0.24));
     const material = new THREE.MeshStandardMaterial({
       color: event.color || "#ffffff",
       emissive: event.color || "#ffffff",
-      emissiveIntensity: 1.25,
-      roughness: 0.2,
-      metalness: 0.3,
+      emissiveIntensity: 1.5,
+      roughness: 0.16,
+      metalness: 0.18,
     });
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 14, 14), material);
-    mesh.castShadow = true;
-    mesh.position.copy(this.toScenePoint(event.x, event.y, 18));
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 10, 10), material);
+    mesh.position.copy(this.toScenePoint(event.x, event.y, PLAYER_Y + 6));
     this.fxRoot.add(mesh);
 
     return {
@@ -1061,6 +1494,7 @@ export class BattleRoyaleGame {
     const group = new THREE.Group();
     const color = effect.color || "#ffffff";
     const radius = Math.max(18, effect.radius || effect.range || 40);
+    const triggerRadius = Math.max(16, effect.triggerRadius || radius * 0.62);
     group.position.copy(this.toScenePoint(effect.x, effect.y, 0));
     const highEnergyTypes = new Set([
       "shockwave",
@@ -1144,6 +1578,82 @@ export class BattleRoyaleGame {
         group.add(core);
         group.userData.core = core;
       }
+
+      if (effect.type === "mine") {
+        const triggerFill = new THREE.Mesh(
+          new THREE.CircleGeometry(1, 56),
+          new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.1,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          })
+        );
+        triggerFill.rotation.x = -Math.PI / 2;
+        triggerFill.position.y = 1.5;
+        triggerFill.scale.set(triggerRadius, triggerRadius, triggerRadius);
+        group.add(triggerFill);
+        group.userData.triggerFill = triggerFill;
+
+        const triggerRing = new THREE.Mesh(
+          new THREE.RingGeometry(0.76, 0.82, 56),
+          new THREE.MeshBasicMaterial({
+            color: "#fff1a8",
+            transparent: true,
+            opacity: 0.24,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          })
+        );
+        triggerRing.rotation.x = -Math.PI / 2;
+        triggerRing.position.y = 3;
+        triggerRing.scale.set(triggerRadius, triggerRadius, triggerRadius);
+        group.add(triggerRing);
+        group.userData.triggerRing = triggerRing;
+
+        const mineBase = new THREE.Mesh(
+          new THREE.CylinderGeometry(16, 21, 10, 14),
+          new THREE.MeshStandardMaterial({
+            color: "#142532",
+            emissive: color,
+            emissiveIntensity: 0.34,
+            roughness: 0.36,
+            metalness: 0.52,
+          })
+        );
+        mineBase.position.y = 8;
+        group.add(mineBase);
+        group.userData.mineBase = mineBase;
+
+        const mineCap = new THREE.Mesh(
+          new THREE.SphereGeometry(7.4, 18, 14),
+          new THREE.MeshStandardMaterial({
+            color: "#dffcff",
+            emissive: color,
+            emissiveIntensity: 0.84,
+            roughness: 0.18,
+            metalness: 0.26,
+          })
+        );
+        mineCap.position.y = 16;
+        group.add(mineCap);
+        group.userData.mineCap = mineCap;
+
+        const mineBeacon = new THREE.Mesh(
+          new THREE.CylinderGeometry(2.2, 7.4, 34, 10, 1, true),
+          new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.22,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          })
+        );
+        mineBeacon.position.y = 28;
+        group.add(mineBeacon);
+        group.userData.mineBeacon = mineBeacon;
+      }
     }
 
     group.userData.type = effect.type;
@@ -1153,12 +1663,15 @@ export class BattleRoyaleGame {
     group.userData.pull = effect.pull || 0;
     group.userData.pulseEvery = effect.pulseEvery || 0;
     group.userData.radius = radius;
+    group.userData.triggerRadius = triggerRadius;
+    group.userData.armedAt = effect.armedAt || 0;
     this.fxRoot.add(group);
 
     return {
       ...effect,
       effectId: effect.effectId || null,
       radius,
+      triggerRadius,
       group,
     };
   }
@@ -1196,7 +1709,7 @@ export class BattleRoyaleGame {
     });
     const sprite = new THREE.Sprite(material);
     sprite.position.set(0, PLAYER_Y + 52, 0);
-    sprite.scale.set(78, 20, 1);
+    sprite.scale.set(90, 24, 1);
 
     const label = {
       canvas,
@@ -1214,7 +1727,7 @@ export class BattleRoyaleGame {
     if (!label.context || !label.sprite) {
       return;
     }
-    const safeName = String(name || "Piloto").slice(0, 18);
+    const safeName = String(name || "Player").slice(0, 18);
     const renderKey = `${safeName}:${isLocal ? "local" : "remote"}`;
     if (label.renderedKey === renderKey) {
       return;
@@ -1233,15 +1746,15 @@ export class BattleRoyaleGame {
     context.fill();
     context.stroke();
 
-    context.font = '700 42px "Oxanium", sans-serif';
+    context.font = '700 50px "Oxanium", sans-serif';
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.fillStyle = isLocal ? "#061018" : "#f3fbff";
     context.fillText(safeName, width / 2, height / 2 - 4);
 
     texture.needsUpdate = true;
-    const widthScale = Math.max(62, Math.min(118, 44 + safeName.length * 4.2));
-    sprite.scale.set(widthScale, 18, 1);
+    const widthScale = Math.max(74, Math.min(134, 56 + safeName.length * 4.8));
+    sprite.scale.set(widthScale, 24, 1);
   }
 
   roundRect(context, x, y, width, height, radius) {
@@ -1263,8 +1776,8 @@ export class BattleRoyaleGame {
     canvas.width = 256;
     canvas.height = 128;
     const context = canvas.getContext("2d");
-    const scaleX = Math.max(24, Math.min(40, 18 + String(text).length * 5));
-    const scaleY = 18;
+    const scaleX = Math.max(34, Math.min(56, 26 + String(text).length * 6));
+    const scaleY = 26;
 
     if (!context) {
       const material = new THREE.SpriteMaterial({
@@ -1285,7 +1798,7 @@ export class BattleRoyaleGame {
     }
 
     context.clearRect(0, 0, canvas.width, canvas.height);
-    context.font = '800 76px "Oxanium", sans-serif';
+    context.font = '800 94px "Oxanium", sans-serif';
     context.textAlign = "center";
     context.textBaseline = "middle";
     context.lineWidth = 12;
@@ -1361,9 +1874,9 @@ export class BattleRoyaleGame {
       String(damage),
       playerId === this.snapshot.localPlayerId ? "#ffd3d3" : "#ffe08f"
     );
-    const position = this.toScenePoint(target.x, target.y, PLAYER_Y + 78 + Math.random() * 8);
-    position.x += (Math.random() - 0.5) * 18;
-    position.z += (Math.random() - 0.5) * 14;
+    const position = this.toScenePoint(target.x, target.y, PLAYER_Y + 88 + Math.random() * 10);
+    position.x += (Math.random() - 0.5) * 22;
+    position.z += (Math.random() - 0.5) * 18;
     label.sprite.position.copy(position);
     this.fxRoot.add(label.sprite);
 
@@ -1393,7 +1906,7 @@ export class BattleRoyaleGame {
     }
 
     const loadout = getLoadout(player.loadoutId);
-    const theme = new THREE.Color(loadout.theme);
+    const theme = new THREE.Color(resolvePlayerColor(player, loadout.theme));
     const group = new THREE.Group();
 
     const ring = new THREE.Mesh(
@@ -1424,7 +1937,7 @@ export class BattleRoyaleGame {
     group.add(body);
 
     const coreMaterial = new THREE.MeshStandardMaterial({
-      color: "#f3fbff",
+      color: theme.clone().lerp(new THREE.Color("#f3fbff"), 0.24),
       emissive: theme,
       emissiveIntensity: 0.9,
       roughness: 0.18,
@@ -1440,7 +1953,7 @@ export class BattleRoyaleGame {
     const weapon = new THREE.Mesh(
       new THREE.BoxGeometry(24, 5, 8),
       new THREE.MeshStandardMaterial({
-        color: "#e8f7ff",
+        color: theme.clone().lerp(new THREE.Color("#ffffff"), 0.14),
         emissive: theme,
         emissiveIntensity: 0.4,
         roughness: 0.38,
@@ -1454,7 +1967,7 @@ export class BattleRoyaleGame {
     const barrier = new THREE.Mesh(
       new THREE.SphereGeometry(26, 24, 18),
       new THREE.MeshBasicMaterial({
-        color: "#8ffff6",
+        color: theme,
         transparent: true,
         opacity: 0.18,
       })
@@ -1466,7 +1979,7 @@ export class BattleRoyaleGame {
     const overclock = new THREE.Mesh(
       new THREE.TorusGeometry(15, 1.8, 10, 28),
       new THREE.MeshBasicMaterial({
-        color: loadout.theme,
+        color: theme,
         transparent: true,
         opacity: 0.75,
       })
@@ -1491,7 +2004,7 @@ export class BattleRoyaleGame {
     const cloakAura = new THREE.Mesh(
       new THREE.TorusGeometry(17, 1.6, 10, 32),
       new THREE.MeshBasicMaterial({
-        color: "#8ec7ff",
+        color: theme,
         transparent: true,
         opacity: 0.72,
       })
@@ -1517,7 +2030,7 @@ export class BattleRoyaleGame {
     const slowedAura = new THREE.Mesh(
       new THREE.TorusGeometry(22, 1.7, 10, 36),
       new THREE.MeshBasicMaterial({
-        color: "#ffb37d",
+        color: theme,
         transparent: true,
         opacity: 0.68,
       })
@@ -1549,7 +2062,7 @@ export class BattleRoyaleGame {
     healthFill.position.z = 0.2;
     healthGroup.add(healthFill);
 
-    const nameplate = this.createNameplateSprite(player.name || "Piloto");
+    const nameplate = this.createNameplateSprite(player.name || "Player");
     group.add(nameplate.sprite);
     group.add(healthGroup);
     this.worldRoot.add(group);
@@ -1603,7 +2116,7 @@ export class BattleRoyaleGame {
     this.updateProjectiles(delta);
     this.updateGroundEffects(now);
 
-    if (this.snapshot.meta?.state === "running" && localRecord?.alive !== false) {
+    if (this.snapshot.meta?.state === "running" && localRecord?.alive !== false && !this.menuOpen) {
       this.updateMovement(delta, now, localRecord);
       this.updateCombat(now, localRecord);
       this.pushPose(now);
@@ -1679,7 +2192,7 @@ export class BattleRoyaleGame {
       projectile.age += delta;
       projectile.x += projectile.vx * delta;
       projectile.y += projectile.vy * delta;
-      projectile.mesh.position.copy(this.toScenePoint(projectile.x, projectile.y, 18));
+      projectile.mesh.position.copy(this.toScenePoint(projectile.x, projectile.y, PLAYER_Y + 6));
 
       const players = [
         ...Array.from(this.remotePlayers.values()),
@@ -1696,13 +2209,13 @@ export class BattleRoyaleGame {
 
       const expired =
         projectile.age >= projectile.lifetime ||
-        projectile.x < 0 ||
-        projectile.y < 0 ||
+        projectile.x < PLAYER_RADIUS ||
+        projectile.y < PLAYER_RADIUS ||
         projectile.x > WORLD_SIZE ||
         projectile.y > WORLD_SIZE;
 
       if (victim || expired) {
-        this.spawnBurst(projectile.x, projectile.y, projectile.color, 9, 85, 18);
+        this.spawnTinyDots(projectile.x, projectile.y, projectile.color, victim ? 4 : 2, 18, PLAYER_Y + 8);
         this.fxRoot.remove(projectile.mesh);
         disposeObject(projectile.mesh);
         return false;
@@ -1724,6 +2237,11 @@ export class BattleRoyaleGame {
       const edge = effect.group.userData.edge;
       const ring = effect.group.userData.ring;
       const core = effect.group.userData.core;
+      const triggerFill = effect.group.userData.triggerFill;
+      const triggerRing = effect.group.userData.triggerRing;
+      const mineBase = effect.group.userData.mineBase;
+      const mineCap = effect.group.userData.mineCap;
+      const mineBeacon = effect.group.userData.mineBeacon;
       const energyBoost =
         effect.type === "storm-pulse" ||
         effect.type === "scan-pulse" ||
@@ -1738,7 +2256,7 @@ export class BattleRoyaleGame {
         const edgeScale = energyBoost ? effect.radius * (pulse * 1.12) : effect.radius * pulse;
         edge.scale.set(edgeScale, edgeScale, edgeScale);
         if (effect.type === "mine" && now >= (effect.armedAt || 0)) {
-          edge.material.opacity = 0.92;
+          edge.material.opacity = 0.98;
         }
       }
 
@@ -1746,7 +2264,7 @@ export class BattleRoyaleGame {
         const ringScale = energyBoost ? effect.radius * (pulse * 1.18) : effect.radius * pulse;
         ring.scale.set(ringScale, ringScale, ringScale);
         if (effect.type === "mine") {
-          ring.material.opacity = now >= (effect.armedAt || Infinity) ? 0.34 : 0.16;
+          ring.material.opacity = now >= (effect.armedAt || Infinity) ? 0.4 : 0.24;
         }
       }
 
@@ -1755,16 +2273,76 @@ export class BattleRoyaleGame {
         core.position.y = (effect.type === "storm" || effect.type === "storm-pulse" ? 28 : 12) + Math.sin(now * 0.008) * (energyBoost ? 6 : 3);
       }
 
+      if (triggerFill) {
+        const armed = now >= (effect.armedAt || 0);
+        const fillScale = effect.triggerRadius * (armed ? pulse : 0.98);
+        triggerFill.scale.set(fillScale, fillScale, fillScale);
+        triggerFill.material.opacity = armed ? 0.12 + Math.sin(now * 0.01) * 0.02 : 0.08;
+      }
+
+      if (triggerRing) {
+        const armed = now >= (effect.armedAt || 0);
+        const pulseScale = effect.triggerRadius * (armed ? pulse * 1.02 : 0.96);
+        triggerRing.scale.set(pulseScale, pulseScale, pulseScale);
+        triggerRing.material.opacity = armed ? 0.38 + Math.sin(now * 0.012) * 0.08 : 0.2;
+        triggerRing.rotation.z += armed ? 0.018 : 0.008;
+      }
+
+      if (mineBase) {
+        mineBase.rotation.y += 0.03;
+      }
+
+      if (mineCap) {
+        const armed = now >= (effect.armedAt || 0);
+        mineCap.position.y = 16 + Math.sin(now * 0.014) * (armed ? 1.2 : 0.45);
+        mineCap.material.emissiveIntensity = armed ? 1.08 : 0.56;
+      }
+
+      if (mineBeacon) {
+        const armed = now >= (effect.armedAt || 0);
+        mineBeacon.position.y = 28 + Math.sin(now * 0.01) * (armed ? 2.4 : 1.2);
+        mineBeacon.material.opacity = armed ? 0.28 + Math.sin(now * 0.012) * 0.08 : 0.15;
+        mineBeacon.scale.x = armed ? 1.06 + Math.sin(now * 0.014) * 0.08 : 0.92;
+        mineBeacon.scale.z = mineBeacon.scale.x;
+      }
+
       return true;
     });
   }
 
-  updateMovement(delta, now, localRecord) {
+  getMovementInputVector() {
     const keyboardX = (this.keys.has("KeyD") ? 1 : 0) - (this.keys.has("KeyA") ? 1 : 0);
     const keyboardY = (this.keys.has("KeyS") ? 1 : 0) - (this.keys.has("KeyW") ? 1 : 0);
-    const dirX = clamp(keyboardX + this.mobile.move.x, -1, 1);
-    const dirY = clamp(keyboardY + this.mobile.move.y, -1, 1);
-    const direction = normalize(dirX, dirY);
+    const x = clamp(keyboardX + this.mobile.move.x, -1, 1);
+    const y = clamp(keyboardY + this.mobile.move.y, -1, 1);
+    const magnitude = Math.hypot(x, y);
+    if (magnitude <= 0.08) {
+      return { x: 0, y: 0, magnitude: 0 };
+    }
+
+    const normalized = normalize(x, y);
+    return {
+      x: normalized.x,
+      y: normalized.y,
+      magnitude,
+    };
+  }
+
+  getDashDirection(originPose) {
+    const movement = this.getMovementInputVector();
+    if (movement.magnitude > 0.08) {
+      return movement;
+    }
+
+    return {
+      x: Math.cos(originPose.aim),
+      y: Math.sin(originPose.aim),
+      magnitude: 1,
+    };
+  }
+
+  updateMovement(delta, now, localRecord) {
+    const movement = this.getMovementInputVector();
     const loadout = getLoadout(localRecord.loadoutId || this.selectedLoadoutId);
     let speed = loadout.moveSpeed;
 
@@ -1780,15 +2358,20 @@ export class BattleRoyaleGame {
       speed *= 0.68;
     }
 
-    if (this.mobile.aim.active) {
+    if (this.mobile.abilityTarget.active && this.mobile.abilityTarget.target) {
+      this.localPose.aim = Math.atan2(
+        this.mobile.abilityTarget.target.y - this.localPose.y,
+        this.mobile.abilityTarget.target.x - this.localPose.x
+      );
+    } else if (this.mobile.aim.active) {
       this.localPose.aim = Math.atan2(this.mobile.aim.y, this.mobile.aim.x);
     } else if (this.mouse.inside) {
       const worldMouse = this.screenToWorld(this.mouse.x, this.mouse.y);
       this.localPose.aim = Math.atan2(worldMouse.y - this.localPose.y, worldMouse.x - this.localPose.x);
     }
 
-    this.localPose.x = clamp(this.localPose.x + direction.x * speed * delta, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS);
-    this.localPose.y = clamp(this.localPose.y + direction.y * speed * delta, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS);
+    this.localPose.x = clamp(this.localPose.x + movement.x * speed * delta, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS);
+    this.localPose.y = clamp(this.localPose.y + movement.y * speed * delta, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS);
 
     if (this.justPressed.has("Enter")) {
       this.camera.x = this.localPose.x;
@@ -1814,8 +2397,296 @@ export class BattleRoyaleGame {
     this.justPressed.clear();
   }
 
+  pointAlongPose(originPose, distance) {
+    return {
+      x: clamp(originPose.x + Math.cos(originPose.aim) * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+      y: clamp(originPose.y + Math.sin(originPose.aim) * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+    };
+  }
+
+  clientToWorld(clientX, clientY) {
+    const bounds = this.canvas.getBoundingClientRect();
+    return this.screenToWorld(
+      clamp(clientX - bounds.left, 0, bounds.width),
+      clamp(clientY - bounds.top, 0, bounds.height)
+    );
+  }
+
+  resolveTempestMineTarget(originPose, options = {}) {
+    if (Number.isFinite(options.targetX) && Number.isFinite(options.targetY)) {
+      return {
+        x: clamp(options.targetX, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+        y: clamp(options.targetY, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+      };
+    }
+
+    if (this.mobile.aim.active) {
+      return this.pointAlongPose(originPose, 210);
+    }
+
+    if (this.mouse.inside) {
+      const target = this.screenToWorld(this.mouse.x, this.mouse.y);
+      return {
+        x: clamp(target.x, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+        y: clamp(target.y, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+      };
+    }
+
+    return this.pointAlongPose(originPose, 210);
+  }
+
+  resolveAbilityTarget(originPose, loadout, slot, options = {}) {
+    if (!this.isPointTargetAbility(loadout.id, slot)) {
+      return null;
+    }
+
+    switch (`${loadout.id}:${slot}`) {
+      case "tempest:E":
+        return this.resolveTempestMineTarget(originPose, options);
+      case "volt:E":
+        if (Number.isFinite(options.targetX) && Number.isFinite(options.targetY)) {
+          return {
+            x: clamp(options.targetX, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(options.targetY, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+          };
+        }
+        return this.pointAlongPose(originPose, 210);
+      case "volt:R":
+        if (Number.isFinite(options.targetX) && Number.isFinite(options.targetY)) {
+          return {
+            x: clamp(options.targetX, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(options.targetY, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+          };
+        }
+        return this.pointAlongPose(originPose, 250);
+      default:
+        return null;
+    }
+  }
+
+  buildAbilityEffectSpec(loadout, slot, target, color, effectId, now, preview = false) {
+    if (!target) {
+      return null;
+    }
+
+    const infiniteExpiry = Number.POSITIVE_INFINITY;
+    switch (`${loadout.id}:${slot}`) {
+      case "tempest:E":
+        return {
+          type: "mine",
+          effectId,
+          x: target.x,
+          y: target.y,
+          radius: 132,
+          triggerRadius: 82,
+          armedAt: preview ? infiniteExpiry : now + 350,
+          expiresAt: preview ? infiniteExpiry : now + 8200,
+          color,
+        };
+      case "volt:E":
+        return {
+          type: "gravity",
+          effectId,
+          x: target.x,
+          y: target.y,
+          radius: 172,
+          pull: 360,
+          pulseEvery: 780,
+          expiresAt: preview ? infiniteExpiry : now + 4600,
+          color,
+        };
+      case "volt:R":
+        return {
+          type: "storm",
+          effectId,
+          x: target.x,
+          y: target.y,
+          radius: 150,
+          pulseEvery: 1000,
+          damage: 13,
+          expiresAt: preview ? infiniteExpiry : now + 5600,
+          color,
+        };
+      default:
+        return null;
+    }
+  }
+
+  upsertMobileAbilityPreview(effect) {
+    if (!effect?.previewKey) {
+      return;
+    }
+
+    const existingIndex = this.groundEffects.findIndex((entry) => entry.previewKey === effect.previewKey);
+    const existing = existingIndex >= 0 ? this.groundEffects[existingIndex] : null;
+
+    if (existing && existing.type !== effect.type) {
+      this.disposeGroundEffect(existing);
+      this.groundEffects.splice(existingIndex, 1);
+    }
+
+    const nextExisting = this.groundEffects.find((entry) => entry.previewKey === effect.previewKey);
+    if (!nextExisting) {
+      this.groundEffects.push(this.createGroundEffectVisual(effect));
+      return;
+    }
+
+    this.updateGroundEffectEntry(nextExisting, effect);
+  }
+
+  updateMobileAbilityTarget(event, localRecord, loadout, slot) {
+    const directTarget = this.clientToWorld(event.clientX, event.clientY);
+    const targetState = this.mobile.abilityTarget;
+    const startWorld = targetState.startWorld || directTarget;
+    const pixelDx = event.clientX - (targetState.startClientX || event.clientX);
+    const pixelDy = event.clientY - (targetState.startClientY || event.clientY);
+    const pixelDistance = Math.hypot(pixelDx, pixelDy);
+    const worldDx = directTarget.x - startWorld.x;
+    const worldDy = directTarget.y - startWorld.y;
+    const acceleration =
+      pixelDistance <= 10
+        ? 1
+        : 1 + clamp(Math.pow((pixelDistance - 10) / 44, 1.02), 0, 1.75);
+    const boostedTarget = {
+      x: startWorld.x + worldDx * acceleration,
+      y: startWorld.y + worldDy * acceleration,
+    };
+    const clampedTarget = {
+      x: clamp(boostedTarget.x, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+      y: clamp(boostedTarget.y, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+    };
+    const effectId = targetState.effectId;
+    const previewKey = targetState.previewKey;
+    const playerColor = resolvePlayerColor(localRecord, loadout.theme);
+    this.mobile.abilityTarget.target = clampedTarget;
+    this.localPose.aim = Math.atan2(clampedTarget.y - this.localPose.y, clampedTarget.x - this.localPose.x);
+
+    const previewEffect = this.buildAbilityEffectSpec(
+      loadout,
+      slot,
+      clampedTarget,
+      playerColor,
+      effectId,
+      Date.now(),
+      true
+    );
+
+    if (previewEffect) {
+      this.upsertMobileAbilityPreview({
+        ...previewEffect,
+        previewKey,
+      });
+    }
+  }
+
+  placeTempestMinePreview(effect) {
+    if (!effect?.effectId) {
+      return;
+    }
+
+    const existing = this.groundEffects.find(
+      (entry) => entry.effectId === effect.effectId && entry.type === "mine"
+    );
+    if (existing) {
+      return;
+    }
+
+    if (Number.isFinite(effect.fromX) && Number.isFinite(effect.fromY)) {
+      this.beams.push(
+        this.createBeamVisual(effect.fromX, effect.fromY, effect.x, effect.y, effect.color, 3.2, 0.12)
+      );
+    }
+    this.spawnBurst(effect.x, effect.y, effect.color, 10, 86, 14);
+    this.groundEffects.push(
+      this.createGroundEffectVisual({
+        ...effect,
+        type: "mine",
+      })
+    );
+  }
+
+  syncTempestMinePreview(effect) {
+    const existing = this.groundEffects.find(
+      (entry) => entry.effectId === effect.effectId && entry.type === "mine"
+    );
+    if (!existing) {
+      this.placeTempestMinePreview(effect);
+      return;
+    }
+
+    this.updateGroundEffectEntry(existing, effect);
+  }
+
+  updateGroundEffectEntry(existing, effect) {
+    if (!existing || !effect) {
+      return;
+    }
+
+    existing.x = effect.x ?? existing.x;
+    existing.y = effect.y ?? existing.y;
+    existing.radius = Math.max(18, effect.radius || existing.radius || 40);
+    existing.triggerRadius = Math.max(
+      16,
+      effect.triggerRadius || existing.triggerRadius || existing.radius * 0.62
+    );
+    existing.armedAt = effect.armedAt ?? existing.armedAt ?? 0;
+    existing.expiresAt = effect.expiresAt ?? existing.expiresAt;
+    existing.group.position.copy(this.toScenePoint(existing.x, existing.y, 0));
+    existing.group.userData.expiresAt = existing.expiresAt ?? existing.group.userData.expiresAt;
+    existing.group.userData.armedAt = existing.armedAt ?? existing.group.userData.armedAt;
+    existing.group.userData.radius = existing.radius;
+    existing.group.userData.triggerRadius = existing.triggerRadius;
+  }
+
+  syncPersistentGroundEffect(effect) {
+    if (!effect?.type) {
+      return;
+    }
+
+    const existing = effect.effectId
+      ? this.groundEffects.find(
+          (entry) => entry.effectId === effect.effectId && entry.type === effect.type
+        )
+      : null;
+
+    if (!existing) {
+      this.groundEffects.push(this.createGroundEffectVisual(effect));
+      return;
+    }
+
+    this.updateGroundEffectEntry(existing, effect);
+  }
+
+  spawnLocalProjectilePreview(originPose, loadout, color, seq) {
+    const primary = loadout.primary;
+    if (!primary?.speed || !primary?.lifetime) {
+      return;
+    }
+
+    const angle =
+      originPose.aim +
+      ((loadout.id === "tempest" ? Math.random() - 0.5 : 0) * (primary.spread || 0));
+    const projectile = {
+      id: `local_proj_${this.snapshot.localPlayerId || "player"}_${seq}_${Math.round(performance.now())}`,
+      ownerId: this.snapshot.localPlayerId,
+      loadoutId: loadout.id,
+      x: originPose.x + Math.cos(angle) * 26,
+      y: originPose.y + Math.sin(angle) * 26,
+      vx: Math.cos(angle) * primary.speed,
+      vy: Math.sin(angle) * primary.speed,
+      radius: primary.radius,
+      lifetime: primary.lifetime,
+      explosionRadius: primary.explosionRadius || null,
+      color,
+    };
+
+    this.projectiles.push(this.createProjectileVisual(projectile));
+    this.spawnTinyDots(projectile.x, projectile.y, color, 2, 14, PLAYER_Y + 6);
+  }
+
   tryPrimary(now, localRecord) {
     const loadout = getLoadout(localRecord.loadoutId || this.selectedLoadoutId);
+    const playerColor = resolvePlayerColor(localRecord, loadout.theme);
     const primary = loadout.primary;
     const rateMs = Math.round((localRecord.effects?.overclockUntil || 0) > now ? primary.rate * 760 : primary.rate * 1000);
 
@@ -1825,40 +2696,64 @@ export class BattleRoyaleGame {
 
     this.localTimers.primaryReadyAt = now + rateMs;
     this.audio.play(primary.sfx);
+    const originPose = { ...this.localPose };
+    const seq = ++this.actionSeq;
     this.onAction?.({
       kind: "primary",
-      pose: { ...this.localPose },
-      seq: ++this.actionSeq,
+      pose: originPose,
+      seq,
       createdAt: now,
     });
 
-    if (loadout.id === "phantom") {
-      const end = {
-        x: this.localPose.x + Math.cos(this.localPose.aim) * primary.range,
-        y: this.localPose.y + Math.sin(this.localPose.aim) * primary.range,
-      };
-      this.beams.push(this.createBeamVisual(this.localPose.x, this.localPose.y, end.x, end.y, primary.color, 4, 0.08));
-    }
-  }
-
-  tryAbility(slot, now, localRecord) {
-    const loadout = getLoadout(localRecord.loadoutId || this.selectedLoadoutId);
-    const ability = loadout.abilities.find((entry) => entry.slot === slot);
-    if (!ability || now < this.localTimers[slot]) {
+    if (loadout.id === "tempest" || loadout.id === "volt") {
+      this.spawnLocalProjectilePreview(originPose, loadout, playerColor, seq);
       return;
     }
 
+    if (loadout.id === "phantom") {
+      const end = {
+        x: originPose.x + Math.cos(originPose.aim) * primary.range,
+        y: originPose.y + Math.sin(originPose.aim) * primary.range,
+      };
+      this.beams.push(this.createBeamVisual(originPose.x, originPose.y, end.x, end.y, playerColor, 4, 0.08));
+      this.spawnTinyDots(originPose.x, originPose.y, playerColor, 2, 12, PLAYER_Y + 6);
+      this.spawnTinyDots(end.x, end.y, playerColor, 2, 12, PLAYER_Y + 8);
+    }
+  }
+
+  castAbility(slot, now, localRecord, options = {}) {
+    const loadout = getLoadout(localRecord.loadoutId || this.selectedLoadoutId);
+    const playerColor = resolvePlayerColor(localRecord, loadout.theme);
+    const ability = loadout.abilities.find((entry) => entry.slot === slot);
+    if (!ability || now < this.localTimers[slot]) {
+      return false;
+    }
+
     const originPose = { ...this.localPose };
+    const dashDirection =
+      `${loadout.id}:${slot}` === "tempest:Q" ? this.getDashDirection(originPose) : null;
+    const targetPoint = this.resolveAbilityTarget(originPose, loadout, slot, options);
+    const effectId =
+      typeof options.effectId === "string" && options.effectId
+        ? options.effectId
+        : targetPoint && this.snapshot.localPlayerId
+          ? `effect_${this.snapshot.localPlayerId}_${slot}_${this.actionSeq + 1}_${Math.round(now)}`
+          : null;
+    const effectSpec = this.buildAbilityEffectSpec(loadout, slot, targetPoint, playerColor, effectId, now, false);
     this.localTimers[slot] = now + ability.cooldown;
 
+    if (this.mobile.abilityTarget.active && this.mobile.abilityTarget.slot === slot) {
+      this.clearMobileAbilityTargeting();
+    }
+
     if (`${loadout.id}:${slot}` === "tempest:Q") {
-      this.previewDash(190, loadout.theme);
+      this.previewDash(190, playerColor, dashDirection);
       this.audio.play("dash");
     } else if (`${loadout.id}:${slot}` === "ember:Q") {
-      this.previewDash(175, loadout.theme);
+      this.previewDash(175, playerColor);
       this.audio.play("impact");
     } else if (`${loadout.id}:${slot}` === "volt:Q") {
-      this.previewDash(160, loadout.theme);
+      this.previewDash(160, playerColor);
       this.audio.play("dash");
     } else if (`${loadout.id}:${slot}` === "tempest:E") {
       this.audio.play("mine");
@@ -1880,20 +2775,61 @@ export class BattleRoyaleGame {
       this.audio.play("storm");
     }
 
+    if (`${loadout.id}:${slot}` === "tempest:E" && effectSpec) {
+      this.placeTempestMinePreview({
+        ...effectSpec,
+        ownerId: this.snapshot.localPlayerId,
+        fromX: originPose.x,
+        fromY: originPose.y,
+      });
+    } else if (effectSpec) {
+      this.syncPersistentGroundEffect(effectSpec);
+    }
+
     this.onAction?.({
       kind: "ability",
       slot,
       pose: originPose,
+      ...(dashDirection
+        ? {
+            dashX: dashDirection.x,
+            dashY: dashDirection.y,
+          }
+        : {}),
+      ...(targetPoint
+        ? {
+            effectId,
+            targetX: targetPoint.x,
+            targetY: targetPoint.y,
+          }
+        : {}),
       seq: ++this.actionSeq,
       createdAt: now,
     });
+    return true;
   }
 
-  previewDash(distance, color) {
+  tryAbility(slot, now, localRecord) {
+    this.castAbility(slot, now, localRecord);
+  }
+
+  previewDash(distance, color, direction = null) {
     const fromX = this.localPose.x;
     const fromY = this.localPose.y;
-    this.localPose.x = clamp(this.localPose.x + Math.cos(this.localPose.aim) * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS);
-    this.localPose.y = clamp(this.localPose.y + Math.sin(this.localPose.aim) * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS);
+    const dashDirection =
+      direction && Math.hypot(direction.x || 0, direction.y || 0) > 0.01
+        ? normalize(direction.x, direction.y)
+        : { x: Math.cos(this.localPose.aim), y: Math.sin(this.localPose.aim) };
+    this.localPose.x = clamp(
+      this.localPose.x + dashDirection.x * distance,
+      PLAYER_RADIUS,
+      WORLD_SIZE - PLAYER_RADIUS
+    );
+    this.localPose.y = clamp(
+      this.localPose.y + dashDirection.y * distance,
+      PLAYER_RADIUS,
+      WORLD_SIZE - PLAYER_RADIUS
+    );
     this.beams.push(this.createBeamVisual(fromX, fromY, this.localPose.x, this.localPose.y, color, 8, 0.14));
     this.spawnBurst(this.localPose.x, this.localPose.y, color, 12, 130, 16);
     this.pushPose(Date.now(), true);
@@ -1937,6 +2873,7 @@ export class BattleRoyaleGame {
       activeIds.add(player.id);
       const loadout = getLoadout(player.loadoutId);
       const visual = this.ensurePlayerVisual(player.id, player);
+      const playerColor = resolvePlayerColor(player, loadout.theme);
       const hitFlash = (this.hitFlashes.get(player.id) || 0) > now;
       const cloakedActive = (player.effects?.cloakUntil || 0) > now;
       const revealedActive = (player.effects?.revealedUntil || 0) > now;
@@ -1958,13 +2895,22 @@ export class BattleRoyaleGame {
 
       visual.group.position.copy(this.toScenePoint(player.x, player.y, 0));
       visual.group.rotation.y = -player.aim;
-      visual.bodyMaterial.color.set(hitFlash ? "#ff8f78" : player.id === this.snapshot.localPlayerId ? "#ffffff" : loadout.theme);
+      visual.bodyMaterial.color.set(hitFlash ? "#ff8f78" : playerColor);
       visual.bodyMaterial.opacity = opacity;
-      visual.bodyMaterial.emissive.set(loadout.theme);
-      visual.bodyMaterial.emissiveIntensity = player.id === this.snapshot.localPlayerId ? 0.7 : 0.38;
+      visual.bodyMaterial.emissive.set(playerColor);
+      visual.bodyMaterial.emissiveIntensity = player.id === this.snapshot.localPlayerId ? 0.78 : 0.44;
+      visual.coreMaterial.color.set(playerColor).lerp(new THREE.Color("#ffffff"), 0.24);
+      visual.coreMaterial.emissive.set(playerColor);
       visual.coreMaterial.opacity = opacity;
       visual.coreMaterial.emissiveIntensity = hitFlash ? 1.4 : player.id === this.snapshot.localPlayerId ? 1.2 : 0.85;
+      visual.weapon.material.color.set(playerColor).lerp(new THREE.Color("#ffffff"), 0.14);
+      visual.weapon.material.emissive.set(playerColor);
+      visual.ring.material.color.set(playerColor);
       visual.ring.material.opacity = player.alive === false ? 0.15 : 0.46 + Math.sin(now * 0.008) * 0.06;
+      visual.barrier.material.color.set(playerColor);
+      visual.overclock.material.color.set(playerColor);
+      visual.cloakAura.material.color.set(playerColor);
+      visual.slowedAura.material.color.set(playerColor);
       visual.barrier.visible = (player.effects?.barrierUntil || 0) > now;
       visual.spawnShield.visible = (player.effects?.spawnShieldUntil || 0) > now;
       visual.overclock.visible = (player.effects?.overclockUntil || 0) > now;
@@ -1982,7 +2928,26 @@ export class BattleRoyaleGame {
       visual.nameplate.sprite.material.opacity = player.alive === false ? 0.42 : cloaked ? 0.34 : 1;
       visual.nameplate.sprite.position.y = PLAYER_Y + 52 + Math.sin(now * 0.004 + player.x * 0.01) * 1.4;
 
-      const healthScale = clamp(player.health / loadout.maxHealth, 0, 1);
+      if (slowedActive && player.alive !== false) {
+        const trailKey = `slow:${player.id}`;
+        const nextTrailAt = this.statusTrailAt.get(trailKey) || 0;
+        if (now >= nextTrailAt) {
+          this.statusTrailAt.set(trailKey, now + 130);
+          const offset = Math.sin(now * 0.01 + player.x * 0.02) * 6;
+          this.spawnBurst(
+            player.x - Math.cos(player.aim) * 10,
+            player.y - Math.sin(player.aim) * 10 + offset,
+            playerColor,
+            2,
+            28,
+            10
+          );
+        }
+      } else {
+        this.statusTrailAt.delete(`slow:${player.id}`);
+      }
+
+      const healthScale = clamp(player.health / Math.max(player.maxHealth || loadout.maxHealth, 1), 0, 1);
       visual.healthFill.scale.x = Math.max(0.001, healthScale);
       visual.healthFill.position.x = -16 + 16 * healthScale;
       visual.healthFill.material.color.set(player.alive === false ? "#8091a0" : "#ff786d");
@@ -2031,21 +2996,26 @@ export class BattleRoyaleGame {
     }
 
     this.lastHudRefresh = now;
+    if (this.snapshot.meta?.state !== "running" && this.snapshot.meta?.state !== "ended") {
+      this.showMatchDetails = false;
+    }
     const localRecord = this.getLocalRecord();
     const loadout = getLoadout(localRecord?.loadoutId || this.selectedLoadoutId);
+    const maxHealth = localRecord?.maxHealth ?? loadout.maxHealth;
+    const maxShield = localRecord?.maxShield ?? loadout.maxShield;
     const alive = Object.values(this.snapshot.players || {}).filter((player) => player.alive !== false).length;
-    const healthValue = localRecord ? localRecord.health : loadout.maxHealth;
-    const shieldValue = localRecord ? localRecord.shield : loadout.maxShield;
+    const healthValue = localRecord ? localRecord.health : maxHealth;
+    const shieldValue = localRecord ? localRecord.shield : maxShield;
     const storm =
       this.snapshot.meta?.startedAt && this.snapshot.meta?.seed
         ? getStormState(this.snapshot.meta.startedAt, this.snapshot.meta.seed, now)
         : null;
     const leaderboard = Object.values(this.snapshot.players || {}).sort(scoreSort);
 
-    this.ui.healthBar.style.width = `${clamp((healthValue / loadout.maxHealth) * 100, 0, 100)}%`;
-    this.ui.shieldBar.style.width = `${clamp((shieldValue / (loadout.maxShield + 36)) * 100, 0, 100)}%`;
-    this.ui.healthLabel.textContent = `${Math.ceil(healthValue)} / ${loadout.maxHealth}`;
-    this.ui.shieldLabel.textContent = `${Math.ceil(shieldValue)} / ${loadout.maxShield}`;
+    this.ui.healthBar.style.width = `${clamp((healthValue / maxHealth) * 100, 0, 100)}%`;
+    this.ui.shieldBar.style.width = `${clamp((shieldValue / (maxShield + 36)) * 100, 0, 100)}%`;
+    this.ui.healthLabel.textContent = `${Math.ceil(healthValue)} / ${maxHealth}`;
+    this.ui.shieldLabel.textContent = `${Math.ceil(shieldValue)} / ${maxShield}`;
     this.ui.killsReadout.textContent = String(localRecord?.kills || 0);
     this.ui.statsReadout.textContent = `K/D/R ${(localRecord?.kills || 0)} / ${(localRecord?.deaths || 0)} / ${(localRecord?.respawns || 0)}`;
     this.ui.aliveReadout.textContent = String(alive);
@@ -2069,7 +3039,7 @@ export class BattleRoyaleGame {
     }
 
     const winnerName = this.snapshot.meta?.winnerId
-      ? this.snapshot.players?.[this.snapshot.meta.winnerId]?.name || "Piloto"
+      ? this.snapshot.players?.[this.snapshot.meta.winnerId]?.name || "Player"
       : "Sem vencedor";
     this.ui.winnerReadout.textContent =
       this.snapshot.meta?.winnerId ? `Vencedor: ${winnerName}` : "Sem vencedor";
@@ -2092,8 +3062,22 @@ export class BattleRoyaleGame {
         : `<article class="score-row"><strong>Nenhum jogador</strong><span>Placares aparecem durante a sala.</span></article>`;
     }
 
+    this.refreshMatchDetailsVisibility();
     this.refreshAbilityBar(now);
     this.refreshRespawnOverlay(localRecord, now);
+  }
+
+  refreshMatchDetailsVisibility() {
+    const hudVisible = !this.mobile.enabled && this.snapshot.meta?.state === "running";
+    const detailsVisible = hudVisible && this.showMatchDetails;
+
+    if (this.ui.hudDetails) {
+      this.ui.hudDetails.hidden = !hudVisible;
+    }
+
+    if (this.ui.statusGrid) {
+      this.ui.statusGrid.hidden = !detailsVisible;
+    }
   }
 
   refreshRespawnOverlay(localRecord, now) {
@@ -2109,43 +3093,34 @@ export class BattleRoyaleGame {
       return;
     }
 
-    if (this.snapshot.meta?.state === "ended" && this.snapshot.meta?.winnerId) {
-      const winner = this.snapshot.players?.[this.snapshot.meta.winnerId]?.name || "Piloto";
-      this.ui.respawnOverlay.hidden = false;
-      this.ui.respawnLabel.textContent = `Partida encerrada. ${winner} venceu.`;
-      this.ui.respawnTimer.textContent = "00:00";
-      return;
-    }
-
     this.ui.respawnOverlay.hidden = true;
   }
 
   refreshAbilityBar(now = Date.now()) {
-    const loadout = getLoadout(this.selectedLoadoutId);
-    const cards = [
-      {
-        slot: "Mouse",
-        name: loadout.primary.label,
-        detail: "Disparo principal",
-        readyIn: Math.max(0, this.localTimers.primaryReadyAt - now),
-      },
-      ...loadout.abilities.map((ability) => ({
-        slot: ability.slot,
-        name: ability.name,
-        detail: ability.summary,
-        readyIn: Math.max(0, (this.localTimers[ability.slot] || 0) - now),
-      })),
-    ];
+    const localRecord = this.getLocalRecord();
+    const loadout = getLoadout(localRecord?.loadoutId || this.selectedLoadoutId);
+    const abilityColor = resolvePlayerColor(localRecord, loadout.theme);
 
-    this.ui.abilityBar.innerHTML = cards
-      .map((card) => {
-        const cooling = card.readyIn > 0;
+    this.ui.abilityBar.innerHTML = loadout.abilities
+      .map((ability) => {
+        const readyIn = Math.max(0, (this.localTimers[ability.slot] || 0) - now);
+        const cooldownValue = readyIn > 0 ? String(Math.ceil(readyIn / 1000)) : "";
+        const iconSvg = renderAbilityIconSvg(ability);
+        const hasIcon = Boolean(iconSvg);
         return `
-          <article class="ability-card ${cooling ? "is-cooling" : ""}">
-            <small>${card.slot}</small>
-            <strong>${card.name}</strong>
-            <small>${cooling ? `Pronto em ${formatClock(card.readyIn)}` : card.detail}</small>
-          </article>
+          <button
+            type="button"
+            class="ability-slot ${readyIn > 0 ? "is-cooling" : ""} ${hasIcon ? "has-icon" : ""}"
+            data-ability-slot="${ability.slot}"
+            data-ability-name="${escapeHtml(ability.name)}"
+            data-ability-detail="${escapeHtml(ability.summary)}"
+            data-ability-damage="${escapeHtml(ability.damageLabel || "")}"
+            tabindex="-1"
+          >
+            ${hasIcon ? `<span class="ability-slot__icon" style="color: ${escapeHtml(abilityColor)}">${iconSvg}</span>` : ""}
+            <span class="ability-slot__key">${ability.slot}</span>
+            <span class="ability-slot__cooldown">${cooldownValue}</span>
+          </button>
         `;
       })
       .join("");
@@ -2158,11 +3133,20 @@ export class BattleRoyaleGame {
       const readyIn = Math.max(0, (this.localTimers[slot] || 0) - now);
       const label = button.querySelector("[data-mobile-label]");
       const meta = button.querySelector("[data-mobile-meta]");
+      const iconSvg = renderAbilityIconSvg(ability);
+      button.dataset.abilitySlot = ability.slot;
+      button.dataset.abilityName = ability.name;
+      button.dataset.abilityDetail = ability.summary;
+      button.dataset.abilityDamage = ability.damageLabel || "";
       if (label) {
-        label.textContent = ability.name;
+        label.innerHTML = iconSvg
+          ? `<span class="mobile-action__face"><span class="mobile-action__icon" style="color: ${escapeHtml(
+              abilityColor
+            )}">${iconSvg}</span><em>${ability.slot}</em></span>`
+          : ability.slot;
       }
       if (meta) {
-        meta.textContent = readyIn > 0 ? formatClock(readyIn) : slot;
+        meta.textContent = readyIn > 0 ? String(Math.ceil(readyIn / 1000)) : "";
       }
       button.classList.toggle("is-cooling", readyIn > 0);
     });
@@ -2224,6 +3208,36 @@ export class BattleRoyaleGame {
         vy: 28 + Math.random() * 58,
         vz: Math.sin(angle) * velocity,
         gravity: 120 + Math.random() * 90,
+      });
+    }
+  }
+
+  spawnTinyDots(x, y, color, count = 2, speed = 16, height = PLAYER_Y + 8) {
+    for (let index = 0; index < count; index += 1) {
+      const angle = Math.random() * TAU;
+      const velocity = speed * (0.42 + Math.random() * 0.4);
+      const position = this.toScenePoint(x, y, height + Math.random() * 4);
+      const material = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.92,
+      });
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.55 + Math.random() * 0.35, 6, 6), material);
+      mesh.position.copy(position);
+      this.fxRoot.add(mesh);
+
+      this.particles.push({
+        mesh,
+        material,
+        x: position.x,
+        y: position.y,
+        z: position.z,
+        life: 0.18 + Math.random() * 0.1,
+        maxLife: 0.24,
+        vx: Math.cos(angle) * velocity,
+        vy: 10 + Math.random() * 18,
+        vz: Math.sin(angle) * velocity,
+        gravity: 52 + Math.random() * 28,
       });
     }
   }
