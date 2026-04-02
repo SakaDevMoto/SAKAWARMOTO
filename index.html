@@ -135,7 +135,7 @@
               </div>
             </div>
 
-            <div class="hud-panel hud-panel--right">
+            <div class="hud-panel hud-panel--right" id="hudDetails" hidden>
               <div class="feed-card">
                 <span>Kill Feed</span>
                 <div id="killFeed" class="feed-list"></div>
@@ -145,6 +145,11 @@
                 <div id="scoreboard" class="scoreboard-list"></div>
               </div>
             </div>
+          </div>
+
+          <div class="storm-chip">
+            <span id="stormReadout">Aguardando partida</span>
+            <small id="stormTimer">00:00</small>
           </div>
 
           <div class="mobile-controls" id="mobileControls">
@@ -179,13 +184,9 @@
         </div>
 
         <div class="ability-bar" id="abilityBar"></div>
+        <div class="ability-tooltip" id="abilityTooltip" hidden></div>
 
-        <div class="status-grid">
-          <article class="status-card">
-            <span>Tempestade</span>
-            <strong id="stormReadout">Aguardando partida</strong>
-            <small id="stormTimer">00:00</small>
-          </article>
+        <div class="status-grid" id="statusGrid" hidden>
           <article class="status-card">
             <span>Jogadores vivos</span>
             <strong id="aliveReadout">0</strong>
