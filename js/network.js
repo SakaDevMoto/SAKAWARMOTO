@@ -31,6 +31,47 @@ const MINE_SLOW_DURATION_MS = 1800;
 const RECON_REVEAL_DURATION_MS = 700;
 const GRAVITY_PULL_STEP_SCALE = 0.012;
 const GRAVITY_PULL_CENTER_PAD = 10;
+const SOLO_BOT_LIMIT = 1;
+const BOT_DECISION_MIN_MS = 360;
+const BOT_DECISION_JITTER_MS = 320;
+
+const BOT_PREFERRED_RANGE = {
+  tempest: 360,
+  ember: 220,
+  phantom: 760,
+  volt: 430,
+};
+
+function createAuthorityState(loadoutId = LOADOUTS[0].id) {
+  return {
+    nextPrimaryAt: 0,
+    cooldowns: { Q: 0, E: 0, R: 0 },
+    lastSeq: 0,
+    stormCarry: 0,
+    respawnQueuedAt: 0,
+    botNextDecisionAt: 0,
+    botStrafeDirection: 1,
+    botPreferredRange: BOT_PREFERRED_RANGE[loadoutId] || 340,
+    botBurstUntil: 0,
+  };
+}
+
+function normalizeProfileName(value) {
+  return String(value ?? "").trim().slice(0, 18);
+}
+
+function formatAutoPlayerName(slotNumber) {
+  return slotNumber > 0 ? `Player ${slotNumber}` : "Player";
+}
+
+function resolveProfileDisplayName(profile = {}) {
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  if (profile.nameCustomized && customName) {
+    return customName;
+  }
+  return formatAutoPlayerName(slotNumber);
+}
 
 function emptyMatchState() {
   return {
@@ -53,8 +94,13 @@ function safeArray(value) {
 
 function createProfileState(profile = {}) {
   const loadout = getLoadout(profile.loadoutId || LOADOUTS[0].id);
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  const nameCustomized = Boolean(profile.nameCustomized && customName);
   return {
-    name: profile.name || "Piloto",
+    name: nameCustomized ? customName : "",
+    nameCustomized,
+    slotNumber,
     loadoutId: loadout.id,
     color: profile.color || loadout.theme,
     joinedAt: profile.joinedAt || Date.now(),
@@ -72,8 +118,15 @@ function createPoseState(pose = {}) {
 
 function createCombatState(profile = {}, patch = {}) {
   const loadout = getLoadout(profile.loadoutId || patch.loadoutId || LOADOUTS[0].id);
+  const resolvedProfile = {
+    ...profile,
+    ...patch,
+    slotNumber: patch.slotNumber ?? profile.slotNumber,
+    name: patch.name ?? profile.name,
+    nameCustomized: patch.nameCustomized ?? profile.nameCustomized,
+  };
   return {
-    name: profile.name || patch.name || "Piloto",
+    name: resolveProfileDisplayName(resolvedProfile),
     loadoutId: loadout.id,
     color: profile.color || patch.color || loadout.theme,
     health: patch.health ?? loadout.maxHealth,
@@ -155,6 +208,24 @@ function comparePlayersForScore(left, right) {
   return (left.joinedAt || 0) - (right.joinedAt || 0);
 }
 
+function isBotPlayerState(playerState) {
+  return Boolean(playerState && typeof playerState.isBot === "function" && playerState.isBot());
+}
+
+function createPracticeBotClass(playroom) {
+  const BotBase = playroom?.Bot;
+  if (!BotBase) {
+    return null;
+  }
+
+  return class PracticeBot extends BotBase {
+    constructor(botParams = {}) {
+      super(botParams);
+      this.botParams = botParams;
+    }
+  };
+}
+
 function hasPlayroomConfig(config) {
   return Boolean(
     (window.Playroom || null) &&
@@ -198,6 +269,7 @@ class PlayroomRoomService {
     this.rpcRegistered = false;
     this.lastMatchPushAt = 0;
     this.matchState = emptyMatchState();
+    this.botClass = createPracticeBotClass(this.playroom);
     this.authority = {
       players: new Map(),
       projectiles: new Map(),
@@ -264,7 +336,10 @@ class PlayroomRoomService {
 
     return {
       id: playerState.id,
-      name: profile.name || combat.name || "Piloto",
+      name: resolveProfileDisplayName(profile),
+      nameCustomized: Boolean(profile.nameCustomized),
+      slotNumber: Math.max(0, Number(profile.slotNumber) || 0),
+      isBot: isBotPlayerState(playerState),
       loadoutId: profile.loadoutId || combat.loadoutId || loadout.id,
       color: profile.color || combat.color || loadout.theme,
       joinedAt: profile.joinedAt || Date.now(),
@@ -344,7 +419,7 @@ class PlayroomRoomService {
   }
 
   registerPlayer(playerState) {
-    if (!playerState) {
+    if (!playerState || this.players.has(playerState.id)) {
       return;
     }
 
@@ -355,7 +430,54 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
+    this.assignRoomPlayerSlots();
+
     this.emitSnapshot();
+  }
+
+  nextAvailablePlayerSlot(usedSlots) {
+    let slotNumber = 1;
+    while (usedSlots.has(slotNumber)) {
+      slotNumber += 1;
+    }
+    return slotNumber;
+  }
+
+  assignRoomPlayerSlots() {
+    if (!this.connected || !this.playroom?.isHost()) {
+      return;
+    }
+
+    const usedSlots = new Set();
+    const players = this.getOrderedPlayers();
+    players.forEach((playerState) => {
+      const currentProfile = createProfileState(playerState.getState(PROFILE_KEY) || {});
+      const hasValidSlot = currentProfile.slotNumber > 0 && !usedSlots.has(currentProfile.slotNumber);
+      const slotNumber = hasValidSlot ? currentProfile.slotNumber : this.nextAvailablePlayerSlot(usedSlots);
+      usedSlots.add(slotNumber);
+
+      const nextProfile = createProfileState({
+        ...currentProfile,
+        slotNumber,
+      });
+
+      const changed =
+        currentProfile.slotNumber !== nextProfile.slotNumber ||
+        currentProfile.name !== nextProfile.name ||
+        currentProfile.nameCustomized !== nextProfile.nameCustomized;
+
+      if (!changed) {
+        return;
+      }
+
+      playerState.setState(PROFILE_KEY, nextProfile, true);
+
+      const match = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+      if (match.state !== "running") {
+        const currentCombat = playerState.getState(COMBAT_KEY) || createCombatState(nextProfile);
+        playerState.setState(COMBAT_KEY, createCombatState(nextProfile, currentCombat), true);
+      }
+    });
   }
 
   async connect(profile, roomCode = "") {
@@ -372,6 +494,15 @@ class PlayroomRoomService {
       gameId: this.config.playroomGameId,
       roomCode: requestedRoomCode || undefined,
       skipLobby: true,
+      enableBots: Boolean(this.botClass),
+      botOptions: this.botClass
+        ? {
+            botClass: this.botClass,
+            botParams: {
+              role: "practice-bot",
+            },
+          }
+        : undefined,
       maxPlayersPerRoom: Math.max(2, this.config.maxPlayersPerRoom || MAX_PLAYERS),
       reconnectGracePeriod: this.config.reconnectGracePeriodMs || 15000,
       baseUrl: this.config.roomBaseUrl || undefined,
@@ -401,7 +532,7 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
-    const runningMatch = this.matchState.state === "running" || this.matchState.state === "ended";
+    const runningMatch = this.matchState.state === "running";
     if (runningMatch && requestedRoomCode) {
       await this.localPlayer.leaveRoom();
       this.connected = false;
@@ -413,6 +544,7 @@ class PlayroomRoomService {
       this.localPlayer.setState(COMBAT_KEY, createCombatState(profileState), true);
       this.localPlayer.setState(POSE_KEY, createPoseState(), false);
     }
+    this.assignRoomPlayerSlots();
 
     this.startPolling();
     this.syncHostLoopStatus();
@@ -436,6 +568,7 @@ class PlayroomRoomService {
     const nextProfile = createProfileState({
       ...profile,
       joinedAt: this.localPlayer.getState(PROFILE_KEY)?.joinedAt || Date.now(),
+      slotNumber: this.localPlayer.getState(PROFILE_KEY)?.slotNumber || 0,
     });
 
     this.localPlayer.setState(PROFILE_KEY, nextProfile, true);
@@ -531,17 +664,126 @@ class PlayroomRoomService {
 
       player.setState(POSE_KEY, createPoseState({ x: spawn.x, y: spawn.y, aim: 0 }), false);
       player.setState(COMBAT_KEY, combat, true);
-      this.authority.players.set(player.id, {
-        nextPrimaryAt: 0,
-        cooldowns: { Q: 0, E: 0, R: 0 },
-        lastSeq: 0,
-        stormCarry: 0,
-        respawnQueuedAt: 0,
-      });
+      this.authority.players.set(player.id, createAuthorityState(profile.loadoutId));
     });
 
     this.pendingMatchSync = true;
     this.flushMatchState(true);
+    this.emitSnapshot();
+  }
+
+  async startSoloPractice(seed) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("A sala solo so pode ser iniciada pelo host.");
+    }
+
+    await this.ensurePracticeBots(seed);
+    await this.startMatch(seed);
+  }
+
+  async endMatch() {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode encerrar a partida.");
+    }
+
+    const now = Date.now();
+    const players = this.getOrderedPlayers();
+    const previous = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+
+    this.matchState = {
+      ...emptyMatchState(),
+      hostId: this.localPlayer.id,
+      revision: (previous.revision || 0) + 1,
+      updatedAt: now,
+    };
+
+    this.authority.projectiles.clear();
+    this.authority.effects.clear();
+    this.authority.players.clear();
+
+    players.forEach((playerState) => {
+      const profile = this.getProfileState(playerState.id);
+      const loadout = getLoadout(profile.loadoutId);
+
+      playerState.setState(POSE_KEY, createPoseState(), false);
+      playerState.setState(
+        COMBAT_KEY,
+        createCombatState(profile, {
+          health: loadout.maxHealth,
+          shield: loadout.maxShield,
+          alive: true,
+          kills: 0,
+          deaths: 0,
+          respawns: 0,
+          respawnAt: 0,
+          effects: {},
+        }),
+        true
+      );
+      this.authority.players.set(playerState.id, createAuthorityState(profile.loadoutId));
+    });
+
+    this.pendingMatchSync = true;
+    this.flushMatchState(true);
+    this.emitSnapshot();
+  }
+
+  async transferLeadership(targetPlayerId) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode transferir a lideranca.");
+    }
+
+    const target = this.players.get(targetPlayerId);
+    if (!target || target.id === this.localPlayer.id || isBotPlayerState(target)) {
+      throw new Error("Escolha um jogador valido para receber a lideranca.");
+    }
+
+    if (typeof this.playroom.transferHost !== "function") {
+      throw new Error("Esta versao do Playroom nao permite transferir a lideranca.");
+    }
+
+    await this.playroom.transferHost(targetPlayerId);
+  }
+
+  async ensurePracticeBots(seed) {
+    if (!this.botClass || typeof this.playroom?.addBot !== "function") {
+      throw new Error("Seu Playroom atual nao expoe suporte a bots nesta pagina.");
+    }
+
+    const existingBots = this.getOrderedPlayers().filter((playerState) => isBotPlayerState(playerState));
+    if (existingBots.length >= SOLO_BOT_LIMIT) {
+      return;
+    }
+
+    for (let index = existingBots.length; index < SOLO_BOT_LIMIT; index += 1) {
+      const bot = await this.playroom.addBot();
+      if (!this.players.has(bot.id)) {
+        this.registerPlayer(bot);
+      }
+      this.setupPracticeBot(bot, index + 1, seed);
+    }
+  }
+
+  setupPracticeBot(bot, index, seed) {
+    if (!bot) {
+      return;
+    }
+
+    const loadoutSeed = Math.abs(seedFromText(`practice-bot:${seed}:${index}`));
+    const loadout = LOADOUTS[loadoutSeed % LOADOUTS.length];
+    const profile = createProfileState({
+      name: `Bot ${index}`,
+      nameCustomized: true,
+      slotNumber: 0,
+      loadoutId: loadout.id,
+      color: loadout.theme,
+      joinedAt: Date.now() + index,
+    });
+
+    bot.setState(PROFILE_KEY, profile, true);
+    bot.setState(POSE_KEY, createPoseState(), false);
+    bot.setState(COMBAT_KEY, createCombatState(profile), true);
+    this.assignRoomPlayerSlots();
     this.emitSnapshot();
   }
 
@@ -551,7 +793,9 @@ class PlayroomRoomService {
     }
 
     if (this.playroom.isHost()) {
-      const others = this.getOrderedPlayers().filter((player) => player.id !== this.localPlayer.id);
+      const others = this.getOrderedPlayers().filter(
+        (player) => player.id !== this.localPlayer.id && !isBotPlayerState(player)
+      );
       if (others.length && typeof this.playroom.transferHost === "function") {
         try {
           await this.playroom.transferHost(others[0].id);
@@ -636,8 +880,51 @@ class PlayroomRoomService {
       .filter(Boolean);
   }
 
+  getHumanRecords(now = Date.now()) {
+    return this.getLiveRecords().filter((record) => {
+      if (record.isBot || record.alive === false) {
+        return false;
+      }
+
+      const cloaked = (record.effects?.cloakUntil || 0) > now;
+      const revealed = (record.effects?.revealedUntil || 0) > now;
+      return !cloaked || revealed;
+    });
+  }
+
   getScoreboardRecords() {
     return this.getLiveRecords().sort(comparePlayersForScore);
+  }
+
+  getActorMoveSpeed(record, now) {
+    const loadout = getLoadout(record.loadoutId);
+    let speed = loadout.moveSpeed;
+
+    if ((record.effects?.overclockUntil || 0) > now) {
+      speed *= 1.22;
+    }
+
+    if ((record.effects?.cloakUntil || 0) > now) {
+      speed *= 1.12;
+    }
+
+    if ((record.effects?.slowedUntil || 0) > now) {
+      speed *= 0.68;
+    }
+
+    return speed;
+  }
+
+  getPrimaryRange(loadout) {
+    if (loadout.primary?.range) {
+      return loadout.primary.range;
+    }
+
+    if (loadout.primary?.speed && loadout.primary?.lifetime) {
+      return loadout.primary.speed * loadout.primary.lifetime;
+    }
+
+    return 520;
   }
 
   findRespawnPoint(playerId, now) {
@@ -661,13 +948,7 @@ class PlayroomRoomService {
       return existing;
     }
 
-    const initial = {
-      nextPrimaryAt: 0,
-      cooldowns: { Q: 0, E: 0, R: 0 },
-      lastSeq: 0,
-      stormCarry: 0,
-      respawnQueuedAt: 0,
-    };
+    const initial = createAuthorityState(this.getProfileState(playerId).loadoutId);
     this.authority.players.set(playerId, initial);
     return initial;
   }
@@ -1428,7 +1709,10 @@ class PlayroomRoomService {
       }
     });
 
+    this.assignRoomPlayerSlots();
+
     if (this.matchState.state === "running") {
+      this.updatePracticeBots(now);
       this.simulateProjectiles(now);
       this.simulateEffects(now);
       this.applyStormDamage(now);
@@ -1639,6 +1923,98 @@ class PlayroomRoomService {
     this.matchState.revision += 1;
     this.pendingMatchSync = true;
   }
+
+  updatePracticeBots(now) {
+    const targets = this.getHumanRecords(now);
+    if (!targets.length) {
+      return;
+    }
+
+    this.getLiveRecords()
+      .filter((record) => record.isBot && record.alive !== false)
+      .forEach((bot) => {
+        const authority = this.ensureAuthorityPlayer(bot.id);
+        const loadout = getLoadout(bot.loadoutId);
+        const target = targets
+          .map((candidate) => ({
+            ...candidate,
+            distance: Math.hypot(candidate.x - bot.x, candidate.y - bot.y),
+          }))
+          .sort((left, right) => left.distance - right.distance)[0];
+
+        if (!target) {
+          return;
+        }
+
+        if (now >= (authority.botNextDecisionAt || 0)) {
+          authority.botNextDecisionAt =
+            now + BOT_DECISION_MIN_MS + Math.random() * BOT_DECISION_JITTER_MS;
+          authority.botStrafeDirection = Math.random() < 0.5 ? -1 : 1;
+          authority.botPreferredRange =
+            (BOT_PREFERRED_RANGE[loadout.id] || 340) * (0.9 + Math.random() * 0.26);
+          authority.botBurstUntil = now + 280 + Math.random() * 720;
+        }
+
+        const angleToTarget = Math.atan2(target.y - bot.y, target.x - bot.x);
+        const preferredRange = authority.botPreferredRange || BOT_PREFERRED_RANGE[loadout.id] || 340;
+        const retreatPad = loadout.id === "ember" ? 30 : 55;
+        const chasePad = loadout.id === "phantom" ? 110 : 80;
+        const toTarget = normalize(target.x - bot.x, target.y - bot.y);
+        const strafe = {
+          x: -toTarget.y * authority.botStrafeDirection,
+          y: toTarget.x * authority.botStrafeDirection,
+        };
+
+        let moveX = strafe.x * 0.78;
+        let moveY = strafe.y * 0.78;
+
+        if (target.distance > preferredRange + chasePad) {
+          moveX += toTarget.x * 1.2;
+          moveY += toTarget.y * 1.2;
+        } else if (target.distance < preferredRange - retreatPad) {
+          moveX -= toTarget.x * 1.18;
+          moveY -= toTarget.y * 1.18;
+        }
+
+        const movement = normalize(moveX, moveY);
+        const step = this.getActorMoveSpeed(bot, now) * 0.78 * (HOST_TICK_MS / 1000);
+        const aimOffset =
+          loadout.id === "ember"
+            ? (Math.random() - 0.5) * 0.18
+            : loadout.id === "phantom"
+              ? (Math.random() - 0.5) * 0.05
+              : (Math.random() - 0.5) * 0.1;
+        const nextPose = this.setPoseState(
+          bot.id,
+          {
+            x: clamp(bot.x + movement.x * step, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(bot.y + movement.y * step, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            aim: wrapAngle(angleToTarget + aimOffset),
+          },
+          false
+        );
+
+        const botActor = {
+          ...bot,
+          x: nextPose?.x ?? bot.x,
+          y: nextPose?.y ?? bot.y,
+          aim: nextPose?.aim ?? angleToTarget,
+        };
+        const aimError = Math.abs(wrapAngle(angleToTarget - botActor.aim));
+        const range = this.getPrimaryRange(loadout);
+        const shouldFire =
+          target.distance <= range * 0.92 &&
+          aimError <= 0.22 &&
+          (target.distance <= preferredRange + 140 || now <= (authority.botBurstUntil || 0));
+
+        if (shouldFire) {
+          this.processPrimaryAction(botActor, authority, {
+            kind: "primary",
+            createdAt: now,
+          });
+        }
+      });
+  }
 }
 
 class MissingConfigService {
@@ -1680,6 +2056,18 @@ class MissingConfigService {
 
   async startMatch() {
     throw new Error("Configure o Playroom para iniciar a partida online.");
+  }
+
+  async startSoloPractice() {
+    throw new Error("Configure o Playroom para iniciar a sala solo.");
+  }
+
+  async endMatch() {
+    throw new Error("Configure o Playroom para encerrar a partida.");
+  }
+
+  async transferLeadership() {
+    throw new Error("Configure o Playroom para transferir a lideranca.");
   }
 
   async leaveRoom() {}
