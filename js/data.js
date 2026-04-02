@@ -40,7 +40,7 @@ export const LOADOUTS = [
         id: "pulse-mine",
         name: "Pulse Mine",
         cooldown: 10500,
-        summary: "Lanca uma mina EMP que explode ao toque e desacelera quem entrar.",
+        summary: "Arremessa uma mina na mira; ela detona por proximidade, causa dano em area e desacelera quem a aciona.",
       },
       {
         slot: "R",
