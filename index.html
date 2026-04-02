@@ -91,7 +91,7 @@
           </div>
           <div class="controls-copy">
             <p><strong>Desktop:</strong> WASD move, mouse mira, clique esquerdo dispara e Q/E/R ativam habilidades.</p>
-            <p><strong>Mobile:</strong> analogico esquerdo move, analogico direito mira, botao FIRE atira e Q/E/R usam habilidades.</p>
+            <p><strong>Mobile:</strong> analogico esquerdo move, joystick direito mira e atira, e as habilidades ficam ao redor dele. Habilidades de alvo no chao usam tocar, arrastar e soltar.</p>
             <p><strong>Enter:</strong> recentra a camera no desktop.</p>
           </div>
         </section>
@@ -117,6 +117,43 @@
             <strong id="respawnTimer">00:00</strong>
           </div>
 
+          <div class="match-menu-overlay" id="matchMenuOverlay" hidden>
+            <div class="match-menu" role="dialog" aria-modal="true" aria-labelledby="matchMenuTitle">
+              <div class="match-menu__header">
+                <strong id="matchMenuTitle">Menu da Partida</strong>
+                <button id="matchMenuCloseButton" class="small-button" type="button">Continuar</button>
+              </div>
+
+              <div class="match-menu__actions">
+                <button id="matchMenuEndButton" class="button button--secondary" type="button" hidden>
+                  Encerrar Partida
+                </button>
+                <button id="matchMenuLeaveButton" class="button button--ghost" type="button">
+                  Sair da Partida
+                </button>
+                <button id="matchMenuSoundButton" class="button button--ghost" type="button">
+                  Sons
+                </button>
+              </div>
+
+              <section class="match-menu__sound" id="matchMenuSoundSection" hidden>
+                <div class="match-menu__sound-header">
+                  <span>Sons</span>
+                  <small id="matchMenuSoundValue">100%</small>
+                </div>
+                <label class="match-menu__slider">
+                  <span>Efeitos</span>
+                  <input id="matchMenuSoundSlider" type="range" min="0" max="100" step="1" value="100">
+                </label>
+              </section>
+
+              <section class="match-menu__transfer" id="matchMenuTransferSection" hidden>
+                <span>Transferir liderança</span>
+                <div class="match-menu__transfer-list" id="matchMenuTransferList"></div>
+              </section>
+            </div>
+          </div>
+
           <div class="hud-layer">
             <div class="hud-panel hud-panel--left">
               <div class="meter-card">
@@ -135,7 +172,7 @@
               </div>
             </div>
 
-            <div class="hud-panel hud-panel--right">
+            <div class="hud-panel hud-panel--right" id="hudDetails" hidden>
               <div class="feed-card">
                 <span>Kill Feed</span>
                 <div id="killFeed" class="feed-list"></div>
@@ -147,45 +184,41 @@
             </div>
           </div>
 
+          <div class="storm-chip">
+            <span id="stormReadout">Aguardando partida</span>
+            <small id="stormTimer">00:00</small>
+          </div>
+
           <div class="mobile-controls" id="mobileControls">
             <div class="mobile-stick-zone" id="movePad">
               <div class="mobile-stick-knob" id="moveStick"></div>
             </div>
 
-            <div class="mobile-right-stack">
+            <div class="mobile-aim-cluster">
+              <button class="mobile-action mobile-action--ability mobile-action--q" id="mobileAbilityQ" type="button">
+                <span data-mobile-label>Q</span>
+                <small data-mobile-meta>Q</small>
+              </button>
+              <button class="mobile-action mobile-action--ability mobile-action--e" id="mobileAbilityE" type="button">
+                <span data-mobile-label>E</span>
+                <small data-mobile-meta>E</small>
+              </button>
+              <button class="mobile-action mobile-action--ability mobile-action--r" id="mobileAbilityR" type="button">
+                <span data-mobile-label>R</span>
+                <small data-mobile-meta>R</small>
+              </button>
+
               <div class="mobile-stick-zone mobile-stick-zone--aim" id="aimPad">
                 <div class="mobile-stick-knob" id="aimStick"></div>
-              </div>
-
-              <div class="mobile-action-cluster">
-                <button class="mobile-action mobile-action--fire" id="mobileFireButton" type="button">
-                  FIRE
-                </button>
-                <button class="mobile-action" id="mobileAbilityQ" type="button">
-                  <span data-mobile-label>Q</span>
-                  <small data-mobile-meta>Q</small>
-                </button>
-                <button class="mobile-action" id="mobileAbilityE" type="button">
-                  <span data-mobile-label>E</span>
-                  <small data-mobile-meta>E</small>
-                </button>
-                <button class="mobile-action" id="mobileAbilityR" type="button">
-                  <span data-mobile-label>R</span>
-                  <small data-mobile-meta>R</small>
-                </button>
               </div>
             </div>
           </div>
         </div>
 
         <div class="ability-bar" id="abilityBar"></div>
+        <div class="ability-tooltip" id="abilityTooltip" hidden></div>
 
-        <div class="status-grid">
-          <article class="status-card">
-            <span>Tempestade</span>
-            <strong id="stormReadout">Aguardando partida</strong>
-            <small id="stormTimer">00:00</small>
-          </article>
+        <div class="status-grid" id="statusGrid" hidden>
           <article class="status-card">
             <span>Jogadores vivos</span>
             <strong id="aliveReadout">0</strong>
