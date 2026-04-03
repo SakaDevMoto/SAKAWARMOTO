@@ -2,6 +2,7 @@ import {
   LOADOUTS,
   MAX_PLAYERS,
   MATCH_LENGTH_MS,
+  PLAYER_COLOR_PALETTE,
   PLAYER_RADIUS,
   RESPAWN_DELAY_MS,
   RESPAWN_SHIELD_MS,
@@ -23,14 +24,178 @@ const PROFILE_KEY = "lz_profile";
 const POSE_KEY = "lz_pose";
 const COMBAT_KEY = "lz_combat";
 const MATCH_KEY = "lz_match";
+const MODERATION_KEY = "lz_moderation";
 const ACTION_RPC = "lz_action";
-const SNAPSHOT_INTERVAL_MS = 70;
-const HOST_TICK_MS = 50;
-const MATCH_PUSH_INTERVAL_MS = 80;
+const SNAPSHOT_INTERVAL_MS = 50;
+const HOST_TICK_MS = 33;
+const MATCH_PUSH_INTERVAL_MS = 50;
+const KICK_TTL_MS = 15000;
+const CLIENT_ID_STORAGE_KEY = "last-zone-client-id";
+const DEFERRED_NOTICE_STORAGE_KEY = "last-zone-room-notice";
 const MINE_SLOW_DURATION_MS = 1800;
 const RECON_REVEAL_DURATION_MS = 700;
 const GRAVITY_PULL_STEP_SCALE = 0.012;
 const GRAVITY_PULL_CENTER_PAD = 10;
+const SOLO_BOT_LIMIT = 1;
+const BOT_DECISION_MIN_MS = 360;
+const BOT_DECISION_JITTER_MS = 320;
+const BOT_STORM_BUFFER = 110;
+const BOT_MINE_ATTRACTION_RADIUS = 560;
+const BOT_POSE_RELIABLE_INTERVAL_MS = 180;
+const PULSE_MINE_TRIGGER_RADIUS = 82;
+const PULSE_MINE_DAMAGE_RADIUS = 132;
+const PULSE_MINE_DAMAGE = 34;
+const PULSE_MINE_ARM_MS = 350;
+const PULSE_MINE_LIFETIME_MS = 8200;
+const VOLT_GRAVITY_DAMAGE = 10;
+const ARC_ORB_DAMAGE = 22;
+const ARC_ORB_SPEED = 280;
+const ARC_ORB_ACCELERATED_SPEED = ARC_ORB_SPEED * 6;
+const ARC_ORB_LIFETIME = 3.8;
+const ARC_ORB_RADIUS = 14;
+const ARC_ORB_TARGET_RANGE = 460;
+const ARC_ORB_TARGET_ARC = 0.96;
+const ARC_ORB_BOUNCE_RADIUS = 300;
+const ARC_ORB_BOUNCES = 3;
+const PRACTICE_PLAYER_HEALTH = 1000;
+const PRACTICE_ENEMY_DAMAGE_SCALE = 0.43;
+
+const BOT_PREFERRED_RANGE = {
+  tempest: 360,
+  ember: 220,
+  volt: 430,
+  phantom: 560,
+};
+
+let cachedLocalClientId = "";
+
+function normalizePlayerColor(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return PLAYER_COLOR_PALETTE.find((color) => color.toLowerCase() === normalized) || "";
+}
+
+function normalizeClientId(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/[^a-z0-9_-]/gi, "")
+    .slice(0, 48);
+}
+
+function getLocalClientId() {
+  if (cachedLocalClientId) {
+    return cachedLocalClientId;
+  }
+
+  try {
+    const stored = normalizeClientId(window.localStorage?.getItem(CLIENT_ID_STORAGE_KEY));
+    if (stored) {
+      cachedLocalClientId = stored;
+      return cachedLocalClientId;
+    }
+  } catch {
+    // Ignora falhas de leitura do storage.
+  }
+
+  cachedLocalClientId = normalizeClientId(`client_${uid("lz_")}`) || `client_${Date.now()}`;
+
+  try {
+    window.localStorage?.setItem(CLIENT_ID_STORAGE_KEY, cachedLocalClientId);
+  } catch {
+    // Ignora falhas de persistencia.
+  }
+
+  return cachedLocalClientId;
+}
+
+function storeDeferredRoomNotice(message) {
+  try {
+    if (message) {
+      window.sessionStorage?.setItem(DEFERRED_NOTICE_STORAGE_KEY, String(message));
+      return;
+    }
+
+    window.sessionStorage?.removeItem(DEFERRED_NOTICE_STORAGE_KEY);
+  } catch {
+    // Ignora falhas de persistencia.
+  }
+}
+
+export function consumeDeferredRoomNotice() {
+  try {
+    const message = window.sessionStorage?.getItem(DEFERRED_NOTICE_STORAGE_KEY) || "";
+    if (message) {
+      window.sessionStorage?.removeItem(DEFERRED_NOTICE_STORAGE_KEY);
+    }
+    return message;
+  } catch {
+    return "";
+  }
+}
+
+function getPlayerColor(slotNumber, seedKey = "") {
+  if (slotNumber > 0) {
+    return PLAYER_COLOR_PALETTE[(slotNumber - 1) % PLAYER_COLOR_PALETTE.length];
+  }
+
+  const seed = Math.abs(seedFromText(String(seedKey || "player-color")));
+  return PLAYER_COLOR_PALETTE[seed % PLAYER_COLOR_PALETTE.length];
+}
+
+function pickAvailablePlayerColor(preferredColor, usedColors, seedKey = "") {
+  const normalizedPreferred = normalizePlayerColor(preferredColor);
+  if (normalizedPreferred && !usedColors.has(normalizedPreferred)) {
+    return normalizedPreferred;
+  }
+
+  const seed = Math.abs(seedFromText(String(seedKey || "player-color")));
+  for (let index = 0; index < PLAYER_COLOR_PALETTE.length; index += 1) {
+    const color = PLAYER_COLOR_PALETTE[(seed + index) % PLAYER_COLOR_PALETTE.length];
+    if (!usedColors.has(color)) {
+      return color;
+    }
+  }
+
+  return normalizedPreferred || getPlayerColor(0, seedKey);
+}
+
+function createAuthorityState(loadoutId = LOADOUTS[0].id) {
+  return {
+    nextPrimaryAt: 0,
+    cooldowns: { Q: 0, E: 0, R: 0 },
+    lastSeq: 0,
+    stormCarry: 0,
+    respawnQueuedAt: 0,
+    botNextDecisionAt: 0,
+    botStrafeDirection: 1,
+    botPreferredRange: BOT_PREFERRED_RANGE[loadoutId] || 340,
+    botBurstUntil: 0,
+    botPauseUntil: 0,
+    botWanderAngle: 0,
+    botReliablePoseAt: 0,
+  };
+}
+
+function scheduleBotFireWindow(authority, now) {
+  authority.botBurstUntil = now + 260 + Math.random() * 560;
+  authority.botPauseUntil = authority.botBurstUntil + 260 + Math.random() * 520;
+}
+
+function normalizeProfileName(value) {
+  return String(value ?? "").trim().slice(0, 18);
+}
+
+function formatAutoPlayerName(slotNumber) {
+  return slotNumber > 0 ? `Player ${slotNumber}` : "Player";
+}
+
+function resolveProfileDisplayName(profile = {}) {
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  if (profile.nameCustomized && customName) {
+    return customName;
+  }
+  return formatAutoPlayerName(slotNumber);
+}
 
 function emptyMatchState() {
   return {
@@ -41,10 +206,147 @@ function emptyMatchState() {
     endsAt: null,
     winnerId: null,
     contestants: 0,
+    practiceMode: false,
     revision: 0,
     updatedAt: 0,
     events: [],
   };
+}
+
+function emptyModerationState() {
+  return {
+    bans: {},
+    kicks: {},
+    revision: 0,
+    updatedAt: 0,
+  };
+}
+
+function sanitizeBanEntry(value, now = Date.now()) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const clientId = normalizeClientId(value.clientId);
+  if (!clientId) {
+    return null;
+  }
+
+  const permanent = Boolean(value.permanent);
+  const expiresAt = Number.isFinite(Number(value.expiresAt)) ? Number(value.expiresAt) : null;
+  if (!permanent && expiresAt && expiresAt <= now) {
+    return null;
+  }
+
+  return {
+    clientId,
+    playerId: value.playerId || "",
+    playerName: normalizeProfileName(value.playerName),
+    issuedAt: Number.isFinite(Number(value.issuedAt)) ? Number(value.issuedAt) : now,
+    expiresAt: permanent ? null : expiresAt,
+    permanent,
+  };
+}
+
+function sanitizeKickEntry(value, now = Date.now()) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const playerId = String(value.playerId || "").trim();
+  if (!playerId) {
+    return null;
+  }
+
+  const expiresAt = Number.isFinite(Number(value.expiresAt))
+    ? Number(value.expiresAt)
+    : (Number.isFinite(Number(value.issuedAt)) ? Number(value.issuedAt) : now) + KICK_TTL_MS;
+
+  if (expiresAt <= now) {
+    return null;
+  }
+
+  return {
+    playerId,
+    clientId: normalizeClientId(value.clientId),
+    playerName: normalizeProfileName(value.playerName),
+    issuedAt: Number.isFinite(Number(value.issuedAt)) ? Number(value.issuedAt) : now,
+    expiresAt,
+  };
+}
+
+function sanitizeModerationState(value, now = Date.now()) {
+  const fallback = emptyModerationState();
+  if (!value || typeof value !== "object") {
+    return fallback;
+  }
+
+  const bans = {};
+  Object.entries(value.bans || {}).forEach(([clientId, entry]) => {
+    const sanitized = sanitizeBanEntry(
+      {
+        ...entry,
+        clientId,
+      },
+      now
+    );
+    if (sanitized) {
+      bans[sanitized.clientId] = sanitized;
+    }
+  });
+
+  const kicks = {};
+  Object.entries(value.kicks || {}).forEach(([playerId, entry]) => {
+    const sanitized = sanitizeKickEntry(
+      {
+        ...entry,
+        playerId,
+      },
+      now
+    );
+    if (sanitized) {
+      kicks[sanitized.playerId] = sanitized;
+    }
+  });
+
+  return {
+    bans,
+    kicks,
+    revision: Number.isFinite(Number(value.revision)) ? Number(value.revision) : 0,
+    updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
+  };
+}
+
+function formatDurationLabel(ms) {
+  const totalMinutes = Math.max(1, Math.ceil(ms / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+
+  if (days > 0) {
+    parts.push(`${days} dia${days === 1 ? "" : "s"}`);
+  }
+  if (hours > 0) {
+    parts.push(`${hours} hora${hours === 1 ? "" : "s"}`);
+  }
+  if (minutes > 0 && days === 0) {
+    parts.push(`${minutes} min`);
+  }
+
+  return parts.slice(0, 2).join(" ") || "1 min";
+}
+
+function buildBanMessage(entry, now = Date.now()) {
+  if (!entry) {
+    return "";
+  }
+
+  if (entry.permanent || !entry.expiresAt) {
+    return "Voce foi banido permanentemente desta sala. Para jogar com esse dono de sala, sera preciso entrar em outra sala.";
+  }
+
+  return `Voce esta banido desta sala por mais ${formatDurationLabel(entry.expiresAt - now)}.`;
 }
 
 function safeArray(value) {
@@ -53,11 +355,23 @@ function safeArray(value) {
 
 function createProfileState(profile = {}) {
   const loadout = getLoadout(profile.loadoutId || LOADOUTS[0].id);
+  const slotNumber = Math.max(0, Number(profile.slotNumber) || 0);
+  const customName = normalizeProfileName(profile.name);
+  const nameCustomized = Boolean(profile.nameCustomized && customName);
+  const joinedAt = profile.joinedAt || Date.now();
+  const requestedColor = normalizePlayerColor(profile.color);
+  const clientId = Boolean(profile.isBot)
+    ? normalizeClientId(profile.clientId) || normalizeClientId(`bot_${joinedAt}_${loadout.id}`)
+    : normalizeClientId(profile.clientId) || getLocalClientId();
   return {
-    name: profile.name || "Piloto",
+    clientId,
+    name: nameCustomized ? customName : "",
+    nameCustomized,
+    isBot: Boolean(profile.isBot),
+    slotNumber,
     loadoutId: loadout.id,
-    color: profile.color || loadout.theme,
-    joinedAt: profile.joinedAt || Date.now(),
+    color: requestedColor || getPlayerColor(slotNumber, `${joinedAt}:${customName || loadout.id}`),
+    joinedAt,
   };
 }
 
@@ -66,14 +380,22 @@ function createPoseState(pose = {}) {
     x: clamp(pose.x ?? WORLD_SIZE / 2, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
     y: clamp(pose.y ?? WORLD_SIZE / 2, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
     aim: pose.aim ?? 0,
+    seq: Math.max(0, Number(pose.seq ?? pose.poseSeq) || 0),
     updatedAt: pose.updatedAt || Date.now(),
   };
 }
 
 function createCombatState(profile = {}, patch = {}) {
   const loadout = getLoadout(profile.loadoutId || patch.loadoutId || LOADOUTS[0].id);
+  const resolvedProfile = {
+    ...profile,
+    ...patch,
+    slotNumber: patch.slotNumber ?? profile.slotNumber,
+    name: patch.name ?? profile.name,
+    nameCustomized: patch.nameCustomized ?? profile.nameCustomized,
+  };
   return {
-    name: profile.name || patch.name || "Piloto",
+    name: resolveProfileDisplayName(resolvedProfile),
     loadoutId: loadout.id,
     color: profile.color || patch.color || loadout.theme,
     health: patch.health ?? loadout.maxHealth,
@@ -84,8 +406,8 @@ function createCombatState(profile = {}, patch = {}) {
     respawns: patch.respawns ?? 0,
     respawnAt: patch.respawnAt ?? 0,
     effects: patch.effects ?? {},
-    maxHealth: loadout.maxHealth,
-    maxShield: loadout.maxShield,
+    maxHealth: patch.maxHealth ?? loadout.maxHealth,
+    maxShield: patch.maxShield ?? loadout.maxShield,
     updatedAt: patch.updatedAt || Date.now(),
   };
 }
@@ -104,6 +426,7 @@ function sanitizeMatchState(value) {
     endsAt: Number.isFinite(Number(value.endsAt)) ? Number(value.endsAt) : null,
     winnerId: value.winnerId || null,
     contestants: Number.isFinite(Number(value.contestants)) ? Number(value.contestants) : 0,
+    practiceMode: Boolean(value.practiceMode),
     revision: Number.isFinite(Number(value.revision)) ? Number(value.revision) : 0,
     updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
     events: safeArray(value.events)
@@ -155,6 +478,24 @@ function comparePlayersForScore(left, right) {
   return (left.joinedAt || 0) - (right.joinedAt || 0);
 }
 
+function isBotPlayerState(playerState) {
+  return Boolean(playerState && typeof playerState.isBot === "function" && playerState.isBot());
+}
+
+function createPracticeBotClass(playroom) {
+  const BotBase = playroom?.Bot;
+  if (!BotBase) {
+    return null;
+  }
+
+  return class PracticeBot extends BotBase {
+    constructor(botParams = {}) {
+      super(botParams);
+      this.botParams = botParams;
+    }
+  };
+}
+
 function hasPlayroomConfig(config) {
   return Boolean(
     (window.Playroom || null) &&
@@ -198,6 +539,9 @@ class PlayroomRoomService {
     this.rpcRegistered = false;
     this.lastMatchPushAt = 0;
     this.matchState = emptyMatchState();
+    this.moderationState = emptyModerationState();
+    this.botClass = createPracticeBotClass(this.playroom);
+    this.pendingForcedRemoval = "";
     this.authority = {
       players: new Map(),
       projectiles: new Map(),
@@ -209,6 +553,7 @@ class PlayroomRoomService {
     return {
       roomId: "",
       meta: emptyMatchState(),
+      moderation: emptyModerationState(),
       players: {},
       events: [],
       localPlayerId: null,
@@ -226,7 +571,16 @@ class PlayroomRoomService {
   }
 
   emitSnapshot() {
-    this.snapshot = this.buildSnapshot();
+    if (this.connected && this.playroom?.isHost()) {
+      this.cleanupModerationState();
+    }
+
+    if (this.handleLocalModeration()) {
+      this.snapshot = this.buildEmptySnapshot();
+    } else {
+      this.snapshot = this.buildSnapshot();
+    }
+
     this.listeners.forEach((listener) => listener(this.snapshot));
   }
 
@@ -236,6 +590,7 @@ class PlayroomRoomService {
     }
 
     const match = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+    const moderation = this.getModerationState();
     const players = {};
 
     for (const [playerId, playerState] of this.players) {
@@ -248,6 +603,7 @@ class PlayroomRoomService {
     return {
       roomId: this.roomId || "",
       meta: match,
+      moderation,
       players,
       events: match.events,
       localPlayerId: this.localPlayer.id,
@@ -264,17 +620,22 @@ class PlayroomRoomService {
 
     return {
       id: playerState.id,
-      name: profile.name || combat.name || "Piloto",
-      loadoutId: profile.loadoutId || combat.loadoutId || loadout.id,
+      clientId: normalizeClientId(profile.clientId),
+      name: resolveProfileDisplayName(profile),
+      nameCustomized: Boolean(profile.nameCustomized),
+      slotNumber: Math.max(0, Number(profile.slotNumber) || 0),
+      isBot: Boolean(profile.isBot || isBotPlayerState(playerState)),
+      loadoutId: loadout.id,
       color: profile.color || combat.color || loadout.theme,
       joinedAt: profile.joinedAt || Date.now(),
       x: pose.x,
       y: pose.y,
       aim: pose.aim ?? 0,
-      health: combat.health ?? loadout.maxHealth,
-      shield: combat.shield ?? loadout.maxShield,
-      maxHealth: loadout.maxHealth,
-      maxShield: loadout.maxShield,
+      poseSeq: Math.max(0, Number(pose.seq) || 0),
+      health: combat.health ?? combat.maxHealth ?? loadout.maxHealth,
+      shield: combat.shield ?? combat.maxShield ?? loadout.maxShield,
+      maxHealth: combat.maxHealth ?? loadout.maxHealth,
+      maxShield: combat.maxShield ?? loadout.maxShield,
       alive: combat.alive !== false,
       kills: combat.kills || 0,
       deaths: combat.deaths || 0,
@@ -344,7 +705,7 @@ class PlayroomRoomService {
   }
 
   registerPlayer(playerState) {
-    if (!playerState) {
+    if (!playerState || this.players.has(playerState.id)) {
       return;
     }
 
@@ -352,10 +713,70 @@ class PlayroomRoomService {
     playerState.onQuit((state) => {
       this.players.delete(state.id);
       this.authority.players.delete(state.id);
+      if (this.playroom?.isHost()) {
+        this.removeKickForPlayer(state.id);
+        this.assignRoomPlayerSlots();
+      }
       this.emitSnapshot();
     });
 
+    this.assignRoomPlayerSlots();
+
     this.emitSnapshot();
+  }
+
+  nextAvailablePlayerSlot(usedSlots) {
+    let slotNumber = 1;
+    while (usedSlots.has(slotNumber)) {
+      slotNumber += 1;
+    }
+    return slotNumber;
+  }
+
+  assignRoomPlayerSlots() {
+    if (!this.connected || !this.playroom?.isHost()) {
+      return;
+    }
+
+    const usedSlots = new Set();
+    const usedColors = new Set();
+    const players = this.getOrderedPlayers();
+    players.forEach((playerState) => {
+      const currentProfile = createProfileState(playerState.getState(PROFILE_KEY) || {});
+      const hasValidSlot = currentProfile.slotNumber > 0 && !usedSlots.has(currentProfile.slotNumber);
+      const slotNumber = hasValidSlot ? currentProfile.slotNumber : this.nextAvailablePlayerSlot(usedSlots);
+      usedSlots.add(slotNumber);
+      const resolvedColor = pickAvailablePlayerColor(
+        currentProfile.color,
+        usedColors,
+        `${slotNumber}:${currentProfile.joinedAt}:${playerState.id}`
+      );
+      usedColors.add(resolvedColor);
+
+      const nextProfile = createProfileState({
+        ...currentProfile,
+        slotNumber,
+        color: resolvedColor,
+      });
+
+      const changed =
+        currentProfile.slotNumber !== nextProfile.slotNumber ||
+        currentProfile.name !== nextProfile.name ||
+        currentProfile.nameCustomized !== nextProfile.nameCustomized ||
+        currentProfile.color !== nextProfile.color;
+
+      if (!changed) {
+        return;
+      }
+
+      playerState.setState(PROFILE_KEY, nextProfile, true);
+
+      const match = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+      if (match.state !== "running") {
+        const currentCombat = playerState.getState(COMBAT_KEY) || createCombatState(nextProfile);
+        playerState.setState(COMBAT_KEY, createCombatState(nextProfile, currentCombat), true);
+      }
+    });
   }
 
   async connect(profile, roomCode = "") {
@@ -366,17 +787,28 @@ class PlayroomRoomService {
     const requestedRoomCode = String(roomCode || "").trim().toUpperCase();
     const profileState = createProfileState(profile);
     this.pendingProfile = profileState;
+    this.pendingForcedRemoval = "";
     this.registerRpc();
 
     await this.playroom.insertCoin({
       gameId: this.config.playroomGameId,
       roomCode: requestedRoomCode || undefined,
       skipLobby: true,
+      enableBots: Boolean(this.botClass),
+      botOptions: this.botClass
+        ? {
+            botClass: this.botClass,
+            botParams: {
+              role: "practice-bot",
+            },
+          }
+        : undefined,
       maxPlayersPerRoom: Math.max(2, this.config.maxPlayersPerRoom || MAX_PLAYERS),
       reconnectGracePeriod: this.config.reconnectGracePeriodMs || 15000,
       baseUrl: this.config.roomBaseUrl || undefined,
       defaultStates: {
         [MATCH_KEY]: emptyMatchState(),
+        [MODERATION_KEY]: emptyModerationState(),
       },
       defaultPlayerStates: {
         [PROFILE_KEY]: profileState,
@@ -389,6 +821,7 @@ class PlayroomRoomService {
     this.localPlayer = this.playroom.myPlayer();
     this.roomId = this.playroom.getRoomCode();
     this.matchState = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+    this.moderationState = this.getModerationState();
     this.players.clear();
     this.registerPlayer(this.localPlayer);
     this.playroom.onPlayerJoin((playerState) => {
@@ -401,7 +834,19 @@ class PlayroomRoomService {
       this.emitSnapshot();
     });
 
-    const runningMatch = this.matchState.state === "running" || this.matchState.state === "ended";
+    const runningMatch = this.matchState.state === "running";
+    const joinRestrictionMessage = requestedRoomCode ? this.getJoinRestrictionMessage(profileState) : "";
+    if (joinRestrictionMessage) {
+      await this.localPlayer.leaveRoom();
+      this.connected = false;
+      this.localPlayer = null;
+      this.roomId = null;
+      this.stopPolling();
+      this.stopHostLoop();
+      this.snapshot = this.buildEmptySnapshot();
+      throw new Error(joinRestrictionMessage);
+    }
+
     if (runningMatch && requestedRoomCode) {
       await this.localPlayer.leaveRoom();
       this.connected = false;
@@ -413,6 +858,7 @@ class PlayroomRoomService {
       this.localPlayer.setState(COMBAT_KEY, createCombatState(profileState), true);
       this.localPlayer.setState(POSE_KEY, createPoseState(), false);
     }
+    this.assignRoomPlayerSlots();
 
     this.startPolling();
     this.syncHostLoopStatus();
@@ -436,6 +882,7 @@ class PlayroomRoomService {
     const nextProfile = createProfileState({
       ...profile,
       joinedAt: this.localPlayer.getState(PROFILE_KEY)?.joinedAt || Date.now(),
+      slotNumber: this.localPlayer.getState(PROFILE_KEY)?.slotNumber || 0,
     });
 
     this.localPlayer.setState(PROFILE_KEY, nextProfile, true);
@@ -448,17 +895,203 @@ class PlayroomRoomService {
     this.emitSnapshot();
   }
 
+  getModerationState() {
+    if (!this.playroom) {
+      return emptyModerationState();
+    }
+
+    this.moderationState = sanitizeModerationState(this.playroom.getState(MODERATION_KEY));
+    return this.moderationState;
+  }
+
+  updateModerationState(mutator, reliable = true) {
+    if (!this.connected || !this.playroom || !this.localPlayer || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode moderar a sala.");
+    }
+
+    const current = this.getModerationState();
+    const draft = {
+      ...current,
+      bans: {
+        ...current.bans,
+      },
+      kicks: {
+        ...current.kicks,
+      },
+    };
+    const result = mutator(draft) || draft;
+    const next = sanitizeModerationState(result);
+    const changed =
+      JSON.stringify(next.bans) !== JSON.stringify(current.bans) ||
+      JSON.stringify(next.kicks) !== JSON.stringify(current.kicks);
+
+    if (!changed) {
+      this.moderationState = current;
+      return current;
+    }
+
+    next.revision = (current.revision || 0) + 1;
+    next.updatedAt = Date.now();
+    this.playroom.setState(MODERATION_KEY, next, reliable);
+    this.moderationState = next;
+    return next;
+  }
+
+  cleanupModerationState() {
+    if (!this.connected || !this.playroom?.isHost()) {
+      return;
+    }
+
+    const current = this.getModerationState();
+    const activePlayerIds = new Set(this.players.keys());
+    const next = {
+      ...current,
+      kicks: {
+        ...current.kicks,
+      },
+      bans: {
+        ...current.bans,
+      },
+    };
+    let changed = false;
+
+    Object.keys(next.kicks).forEach((playerId) => {
+      if (!activePlayerIds.has(playerId)) {
+        delete next.kicks[playerId];
+        changed = true;
+      }
+    });
+
+    if (!changed) {
+      return;
+    }
+
+    next.revision = (current.revision || 0) + 1;
+    next.updatedAt = Date.now();
+    this.playroom.setState(MODERATION_KEY, sanitizeModerationState(next), true);
+    this.moderationState = sanitizeModerationState(next);
+  }
+
+  removeKickForPlayer(playerId) {
+    if (!this.connected || !this.playroom?.isHost() || !playerId) {
+      return;
+    }
+
+    const current = this.getModerationState();
+    if (!current.kicks[playerId]) {
+      return;
+    }
+
+    const next = {
+      ...current,
+      kicks: {
+        ...current.kicks,
+      },
+      bans: {
+        ...current.bans,
+      },
+      revision: (current.revision || 0) + 1,
+      updatedAt: Date.now(),
+    };
+    delete next.kicks[playerId];
+    this.playroom.setState(MODERATION_KEY, sanitizeModerationState(next), true);
+    this.moderationState = sanitizeModerationState(next);
+  }
+
+  getJoinRestrictionMessage(profile) {
+    const moderation = this.getModerationState();
+    const clientId = normalizeClientId(profile?.clientId);
+    if (!clientId) {
+      return "";
+    }
+
+    return buildBanMessage(moderation.bans[clientId]);
+  }
+
+  getLocalModerationMessage() {
+    if (!this.localPlayer) {
+      return "";
+    }
+
+    const moderation = this.getModerationState();
+    const profile = this.localPlayer.getState(PROFILE_KEY) || this.pendingProfile || createProfileState();
+    const clientId = normalizeClientId(profile.clientId);
+    const banEntry = clientId ? moderation.bans[clientId] : null;
+    if (banEntry) {
+      return buildBanMessage(banEntry);
+    }
+
+    if (moderation.kicks[this.localPlayer.id]) {
+      return "Voce foi expulso da sala pelo dono. Se quiser voltar, entre novamente com o codigo da sala.";
+    }
+
+    return "";
+  }
+
+  handleLocalModeration() {
+    const message = this.getLocalModerationMessage();
+    if (!message || this.pendingForcedRemoval) {
+      return false;
+    }
+
+    this.pendingForcedRemoval = message;
+    storeDeferredRoomNotice(message);
+    this.connected = false;
+    this.stopPolling();
+    this.stopHostLoop();
+
+    const player = this.localPlayer;
+    this.localPlayer = null;
+    this.roomId = null;
+
+    (async () => {
+      try {
+        await player?.leaveRoom?.();
+      } catch (error) {
+        console.warn("Nao foi possivel sair da sala apos moderacao.", error);
+      } finally {
+        window.location.reload();
+      }
+    })();
+
+    return true;
+  }
+
+  resolveModerationTarget(targetPlayerId) {
+    const target = this.players.get(targetPlayerId);
+    if (!target || target.id === this.localPlayer?.id || isBotPlayerState(target)) {
+      throw new Error("Escolha um jogador valido para moderar.");
+    }
+
+    const profile = this.getProfileState(target.id);
+    const clientId = normalizeClientId(profile.clientId);
+    if (!clientId) {
+      throw new Error("Nao consegui identificar esse jogador para moderacao.");
+    }
+
+    return {
+      playerId: target.id,
+      clientId,
+      playerName: resolveProfileDisplayName(profile),
+    };
+  }
+
   async updatePose(pose) {
     if (!this.localPlayer || !this.connected) {
       return;
     }
 
     const currentPose = this.localPlayer.getState(POSE_KEY) || createPoseState();
+    const nextPoseSeq = Math.max(
+      Math.max(0, Number(currentPose.seq) || 0) + 1,
+      Math.max(0, Number(pose?.seq ?? pose?.poseSeq) || 0)
+    );
     this.localPlayer.setState(
       POSE_KEY,
       createPoseState({
         ...currentPose,
         ...pose,
+        seq: nextPoseSeq,
         updatedAt: Date.now(),
       }),
       false
@@ -488,7 +1121,7 @@ class PlayroomRoomService {
     await this.rpc.call(ACTION_RPC, payload, this.rpc.Mode.HOST);
   }
 
-  async startMatch(seed) {
+  async startMatch(seed, options = {}) {
     if (!this.connected || !this.playroom.isHost()) {
       throw new Error("Apenas o host pode iniciar a partida.");
     }
@@ -496,6 +1129,7 @@ class PlayroomRoomService {
     const now = Date.now();
     const players = this.getOrderedPlayers();
     const normalizedSeed = Number(seed) || seedFromText(`${this.roomId}:${now}`);
+    const practiceMode = Boolean(options.practiceMode);
 
     this.matchState = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
     this.matchState = {
@@ -506,6 +1140,7 @@ class PlayroomRoomService {
       endsAt: now + MATCH_LENGTH_MS,
       winnerId: null,
       contestants: players.length,
+      practiceMode,
       revision: (this.matchState.revision || 0) + 1,
       updatedAt: now,
       events: [],
@@ -518,9 +1153,12 @@ class PlayroomRoomService {
     players.forEach((player, index) => {
       const spawn = getSpawnPoint(index, players.length, normalizedSeed);
       const profile = this.getProfileState(player.id);
+      const vitals = this.getConfiguredVitals(profile, this.matchState);
       const combat = createCombatState(profile, {
-        health: getLoadout(profile.loadoutId).maxHealth,
-        shield: getLoadout(profile.loadoutId).maxShield,
+        health: vitals.maxHealth,
+        shield: vitals.maxShield,
+        maxHealth: vitals.maxHealth,
+        maxShield: vitals.maxShield,
         alive: true,
         kills: 0,
         deaths: 0,
@@ -531,17 +1169,180 @@ class PlayroomRoomService {
 
       player.setState(POSE_KEY, createPoseState({ x: spawn.x, y: spawn.y, aim: 0 }), false);
       player.setState(COMBAT_KEY, combat, true);
-      this.authority.players.set(player.id, {
-        nextPrimaryAt: 0,
-        cooldowns: { Q: 0, E: 0, R: 0 },
-        lastSeq: 0,
-        stormCarry: 0,
-        respawnQueuedAt: 0,
-      });
+      this.authority.players.set(player.id, createAuthorityState(combat.loadoutId));
     });
 
     this.pendingMatchSync = true;
     this.flushMatchState(true);
+    this.emitSnapshot();
+  }
+
+  async startSoloPractice(seed) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("A sala solo so pode ser iniciada pelo host.");
+    }
+
+    await this.ensurePracticeBots(seed);
+    await this.startMatch(seed, { practiceMode: true });
+  }
+
+  async endMatch() {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode encerrar a partida.");
+    }
+
+    const now = Date.now();
+    const players = this.getOrderedPlayers();
+    const previous = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+
+    this.matchState = {
+      ...emptyMatchState(),
+      hostId: this.localPlayer.id,
+      revision: (previous.revision || 0) + 1,
+      updatedAt: now,
+    };
+
+    this.authority.projectiles.clear();
+    this.authority.effects.clear();
+    this.authority.players.clear();
+
+    players.forEach((playerState) => {
+      const profile = this.getProfileState(playerState.id);
+      const loadout = getLoadout(profile.loadoutId);
+
+      playerState.setState(POSE_KEY, createPoseState(), false);
+      playerState.setState(
+        COMBAT_KEY,
+        createCombatState(profile, {
+          health: loadout.maxHealth,
+          shield: loadout.maxShield,
+          alive: true,
+          kills: 0,
+          deaths: 0,
+          respawns: 0,
+          respawnAt: 0,
+          effects: {},
+        }),
+        true
+      );
+      this.authority.players.set(playerState.id, createAuthorityState(profile.loadoutId));
+    });
+
+    this.pendingMatchSync = true;
+    this.flushMatchState(true);
+    this.emitSnapshot();
+  }
+
+  async transferLeadership(targetPlayerId) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode transferir a lideranca.");
+    }
+
+    const target = this.players.get(targetPlayerId);
+    if (!target || target.id === this.localPlayer.id || isBotPlayerState(target)) {
+      throw new Error("Escolha um jogador valido para receber a lideranca.");
+    }
+
+    if (typeof this.playroom.transferHost !== "function") {
+      throw new Error("Esta versao do Playroom nao permite transferir a lideranca.");
+    }
+
+    await this.playroom.transferHost(targetPlayerId);
+  }
+
+  async kickPlayer(targetPlayerId) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode expulsar jogadores.");
+    }
+
+    const target = this.resolveModerationTarget(targetPlayerId);
+    const now = Date.now();
+    this.updateModerationState((draft) => {
+      draft.kicks[target.playerId] = {
+        playerId: target.playerId,
+        clientId: target.clientId,
+        playerName: target.playerName,
+        issuedAt: now,
+        expiresAt: now + KICK_TTL_MS,
+      };
+      return draft;
+    });
+    this.emitSnapshot();
+  }
+
+  async banPlayer(targetPlayerId, options = {}) {
+    if (!this.connected || !this.playroom.isHost()) {
+      throw new Error("Apenas o host pode banir jogadores.");
+    }
+
+    const target = this.resolveModerationTarget(targetPlayerId);
+    const permanent = Boolean(options.permanent);
+    const durationMs = Number(options.durationMs);
+    if (!permanent && (!Number.isFinite(durationMs) || durationMs <= 0)) {
+      throw new Error("Informe um tempo valido para o banimento.");
+    }
+
+    const now = Date.now();
+    this.updateModerationState((draft) => {
+      draft.bans[target.clientId] = {
+        clientId: target.clientId,
+        playerId: target.playerId,
+        playerName: target.playerName,
+        issuedAt: now,
+        expiresAt: permanent ? null : now + durationMs,
+        permanent,
+      };
+      draft.kicks[target.playerId] = {
+        playerId: target.playerId,
+        clientId: target.clientId,
+        playerName: target.playerName,
+        issuedAt: now,
+        expiresAt: now + KICK_TTL_MS,
+      };
+      return draft;
+    });
+    this.emitSnapshot();
+  }
+
+  async ensurePracticeBots(seed) {
+    if (!this.botClass || typeof this.playroom?.addBot !== "function") {
+      throw new Error("Seu Playroom atual nao expoe suporte a bots nesta pagina.");
+    }
+
+    const existingBots = this.getOrderedPlayers().filter((playerState) => isBotPlayerState(playerState));
+    if (existingBots.length >= SOLO_BOT_LIMIT) {
+      return;
+    }
+
+    for (let index = existingBots.length; index < SOLO_BOT_LIMIT; index += 1) {
+      const bot = await this.playroom.addBot();
+      if (!this.players.has(bot.id)) {
+        this.registerPlayer(bot);
+      }
+      this.setupPracticeBot(bot, index + 1, seed);
+    }
+  }
+
+  setupPracticeBot(bot, index, seed) {
+    if (!bot) {
+      return;
+    }
+
+    const loadoutSeed = Math.abs(seedFromText(`practice-bot:${seed}:${index}`));
+    const loadout = LOADOUTS[loadoutSeed % LOADOUTS.length];
+    const profile = createProfileState({
+      name: `Bot ${index}`,
+      nameCustomized: true,
+      isBot: true,
+      slotNumber: 0,
+      loadoutId: loadout.id,
+      joinedAt: Date.now() + index,
+    });
+
+    bot.setState(PROFILE_KEY, profile, true);
+    bot.setState(POSE_KEY, createPoseState(), false);
+    bot.setState(COMBAT_KEY, createCombatState(profile), true);
+    this.assignRoomPlayerSlots();
     this.emitSnapshot();
   }
 
@@ -551,7 +1352,9 @@ class PlayroomRoomService {
     }
 
     if (this.playroom.isHost()) {
-      const others = this.getOrderedPlayers().filter((player) => player.id !== this.localPlayer.id);
+      const others = this.getOrderedPlayers().filter(
+        (player) => player.id !== this.localPlayer.id && !isBotPlayerState(player)
+      );
       if (others.length && typeof this.playroom.transferHost === "function") {
         try {
           await this.playroom.transferHost(others[0].id);
@@ -615,9 +1418,14 @@ class PlayroomRoomService {
     }
 
     const current = this.getPoseState(playerId);
+    const nextPoseSeq = Math.max(
+      Math.max(0, Number(current.seq) || 0) + 1,
+      Math.max(0, Number(patch?.seq ?? patch?.poseSeq) || 0)
+    );
     const next = createPoseState({
       ...current,
       ...patch,
+      seq: nextPoseSeq,
       updatedAt: Date.now(),
     });
 
@@ -636,8 +1444,60 @@ class PlayroomRoomService {
       .filter(Boolean);
   }
 
+  getHumanRecords(now = Date.now()) {
+    return this.getLiveRecords().filter((record) => {
+      if (record.isBot || record.alive === false) {
+        return false;
+      }
+
+      const cloaked = (record.effects?.cloakUntil || 0) > now;
+      const revealed = (record.effects?.revealedUntil || 0) > now;
+      return !cloaked || revealed;
+    });
+  }
+
   getScoreboardRecords() {
     return this.getLiveRecords().sort(comparePlayersForScore);
+  }
+
+  getConfiguredVitals(profile, match = this.matchState) {
+    const loadout = getLoadout(profile?.loadoutId);
+    const practiceHuman = Boolean(match?.practiceMode && !profile?.isBot);
+    return {
+      maxHealth: practiceHuman ? PRACTICE_PLAYER_HEALTH : loadout.maxHealth,
+      maxShield: loadout.maxShield,
+    };
+  }
+
+  getActorMoveSpeed(record, now) {
+    const loadout = getLoadout(record.loadoutId);
+    let speed = loadout.moveSpeed;
+
+    if ((record.effects?.overclockUntil || 0) > now) {
+      speed *= 1.22;
+    }
+
+    if ((record.effects?.cloakUntil || 0) > now) {
+      speed *= 1.12;
+    }
+
+    if ((record.effects?.slowedUntil || 0) > now) {
+      speed *= 0.68;
+    }
+
+    return speed;
+  }
+
+  getPrimaryRange(loadout) {
+    if (loadout.primary?.range) {
+      return loadout.primary.range;
+    }
+
+    if (loadout.primary?.speed && loadout.primary?.lifetime) {
+      return loadout.primary.speed * loadout.primary.lifetime;
+    }
+
+    return 520;
   }
 
   findRespawnPoint(playerId, now) {
@@ -661,26 +1521,22 @@ class PlayroomRoomService {
       return existing;
     }
 
-    const initial = {
-      nextPrimaryAt: 0,
-      cooldowns: { Q: 0, E: 0, R: 0 },
-      lastSeq: 0,
-      stormCarry: 0,
-      respawnQueuedAt: 0,
-    };
+    const initial = createAuthorityState(this.getProfileState(playerId).loadoutId);
     this.authority.players.set(playerId, initial);
     return initial;
   }
 
   enqueueEvent(event) {
-    this.matchState.events = [
-      ...safeArray(this.matchState.events),
-      {
-        id: event.id || uid("evt_"),
-        createdAt: event.createdAt || Date.now(),
-        ...event,
-      },
-    ].slice(-260);
+    const events = safeArray(this.matchState.events);
+    events.push({
+      id: event.id || uid("evt_"),
+      createdAt: event.createdAt || Date.now(),
+      ...event,
+    });
+    if (events.length > 260) {
+      events.splice(0, events.length - 260);
+    }
+    this.matchState.events = events;
 
     this.matchState.updatedAt = Date.now();
     this.matchState.revision += 1;
@@ -717,7 +1573,7 @@ class PlayroomRoomService {
       action.pose && typeof action.pose === "object"
         ? {
             ...actor,
-            ...createPoseState(action.pose),
+            ...(this.setPoseState(playerId, action.pose, false) || createPoseState(action.pose)),
           }
         : actor;
 
@@ -742,6 +1598,7 @@ class PlayroomRoomService {
     const now = Date.now();
     const loadout = getLoadout(actor.loadoutId);
     const primary = loadout.primary;
+    const actorColor = actor.color || loadout.theme;
     const rateMs = Math.round(
       (actor.effects?.overclockUntil || 0) > now ? primary.rate * 760 : primary.rate * 1000
     );
@@ -768,12 +1625,13 @@ class PlayroomRoomService {
         damage: primary.damage,
         lifetime: primary.lifetime,
         explosionRadius: primary.explosionRadius || null,
-        color: primary.color,
+        color: actorColor,
         age: 0,
       });
 
       this.enqueueEvent({
         type: "projectile",
+        projectileId,
         ownerId: actor.id,
         loadoutId: loadout.id,
         x: actor.x + Math.cos(angle) * 26,
@@ -784,7 +1642,7 @@ class PlayroomRoomService {
         damage: primary.damage,
         lifetime: primary.lifetime,
         explosionRadius: primary.explosionRadius || null,
-        color: primary.color,
+        color: actorColor,
       });
       return;
     }
@@ -804,7 +1662,7 @@ class PlayroomRoomService {
         y: actor.y,
         toX: end.x,
         toY: end.y,
-        color: primary.color,
+        color: actorColor,
         width: 4,
         sfx: "sniper",
       });
@@ -840,7 +1698,7 @@ class PlayroomRoomService {
         x: actor.x,
         y: actor.y,
         traces,
-        color: primary.color,
+        color: actorColor,
       });
 
       hits.forEach((damage, targetId) => {
@@ -852,6 +1710,7 @@ class PlayroomRoomService {
   processAbilityAction(actor, authority, action) {
     const now = Date.now();
     const loadout = getLoadout(actor.loadoutId);
+    const actorColor = actor.color || loadout.theme;
     const ability = loadout.abilities.find((entry) => entry.slot === action.slot);
 
     if (!ability || now < authority.cooldowns[action.slot]) {
@@ -861,36 +1720,51 @@ class PlayroomRoomService {
     authority.cooldowns[action.slot] = now + ability.cooldown;
 
     switch (`${loadout.id}:${action.slot}`) {
-      case "tempest:Q":
-        this.performDash(actor, 190, loadout.theme);
+      case "tempest:Q": {
+        const dashVector =
+          Number.isFinite(action.dashX) &&
+          Number.isFinite(action.dashY) &&
+          Math.hypot(action.dashX, action.dashY) > 0.08
+            ? normalize(action.dashX, action.dashY)
+            : null;
+        this.performDash(actor, 190, actorColor, dashVector);
         break;
+      }
       case "tempest:E":
         {
-          const effectId = uid("mine_");
+          const mineTarget = {
+            x: clamp(action.targetX ?? actor.x + Math.cos(actor.aim) * 180, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(action.targetY ?? actor.y + Math.sin(actor.aim) * 180, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+          };
+          const effectId = typeof action.effectId === "string" && action.effectId ? action.effectId : uid("mine_");
           this.authority.effects.set(uid("fx_"), {
             id: effectId,
             type: "mine",
             ownerId: actor.id,
-            x: actor.x,
-            y: actor.y,
-            radius: 88,
-            armedAt: now + 400,
-            expiresAt: now + 7000,
-            damage: 34,
-            color: loadout.theme,
+            x: mineTarget.x,
+            y: mineTarget.y,
+            radius: PULSE_MINE_DAMAGE_RADIUS,
+            triggerRadius: PULSE_MINE_TRIGGER_RADIUS,
+            armedAt: now + PULSE_MINE_ARM_MS,
+            expiresAt: now + PULSE_MINE_LIFETIME_MS,
+            damage: PULSE_MINE_DAMAGE,
+            color: actorColor,
           });
           this.enqueueEvent({
             type: "mine",
             effectId,
             ownerId: actor.id,
             loadoutId: loadout.id,
-            x: actor.x,
-            y: actor.y,
-            radius: 88,
-            armedAt: now + 400,
-            expiresAt: now + 7000,
-            damage: 34,
-            color: loadout.theme,
+            x: mineTarget.x,
+            y: mineTarget.y,
+            fromX: actor.x,
+            fromY: actor.y,
+            radius: PULSE_MINE_DAMAGE_RADIUS,
+            triggerRadius: PULSE_MINE_TRIGGER_RADIUS,
+            armedAt: now + PULSE_MINE_ARM_MS,
+            expiresAt: now + PULSE_MINE_LIFETIME_MS,
+            damage: PULSE_MINE_DAMAGE,
+            color: actorColor,
           });
         }
         break;
@@ -907,12 +1781,18 @@ class PlayroomRoomService {
           buff: "overclock",
           x: actor.x,
           y: actor.y,
-          color: loadout.theme,
+          color: actorColor,
         });
         break;
       case "ember:Q": {
+        const dashVector =
+          Number.isFinite(action.dashX) &&
+          Number.isFinite(action.dashY) &&
+          Math.hypot(action.dashX, action.dashY) > 0.08
+            ? normalize(action.dashX, action.dashY)
+            : null;
         const origin = { x: actor.x, y: actor.y };
-        const finalPose = this.performDash(actor, 175, loadout.theme);
+        const finalPose = this.performDash(actor, 175, actorColor, dashVector);
         this.enqueueEvent({
           type: "slam",
           ownerId: actor.id,
@@ -922,7 +1802,7 @@ class PlayroomRoomService {
           toX: finalPose.x,
           toY: finalPose.y,
           radius: 128,
-          color: loadout.theme,
+          color: actorColor,
         });
         this.radialDamage(finalPose.x, finalPose.y, 128, 24, actor.id, "Breach Slam");
         break;
@@ -941,7 +1821,7 @@ class PlayroomRoomService {
           buff: "barrier",
           x: actor.x,
           y: actor.y,
-          color: loadout.theme,
+          color: actorColor,
         });
         break;
       case "ember:R":
@@ -953,7 +1833,7 @@ class PlayroomRoomService {
           y: actor.y,
           angle: actor.aim,
           range: 260,
-          color: loadout.theme,
+          color: actorColor,
         });
         this.coneDamage(actor, actor.aim, 260, 0.72, 30, actor.id, "Dragon Roar");
         break;
@@ -970,7 +1850,7 @@ class PlayroomRoomService {
           buff: "cloak",
           x: actor.x,
           y: actor.y,
-          color: loadout.theme,
+          color: actorColor,
         });
         break;
       case "phantom:E": {
@@ -986,7 +1866,7 @@ class PlayroomRoomService {
           expiresAt: now + 5200,
           pulseEvery: 850,
           nextPulseAt: now + 120,
-          color: loadout.theme,
+          color: actorColor,
         });
         this.enqueueEvent({
           type: "recon",
@@ -998,7 +1878,7 @@ class PlayroomRoomService {
           radius: 260,
           expiresAt: now + 5200,
           pulseEvery: 850,
-          color: loadout.theme,
+          color: actorColor,
         });
         break;
       }
@@ -1016,7 +1896,7 @@ class PlayroomRoomService {
           y: actor.y,
           toX: end.x,
           toY: end.y,
-          color: loadout.theme,
+          color: actorColor,
           width: 8,
           sfx: "beam",
         });
@@ -1026,32 +1906,66 @@ class PlayroomRoomService {
         break;
       }
       case "volt:Q": {
-        const origin = { x: actor.x, y: actor.y };
-        const finalPose = this.performDash(actor, 160, loadout.theme);
-        const chains = this.getTargetsInRadius(finalPose.x, finalPose.y, 175, actor.id).slice(0, 3);
-        this.enqueueEvent({
-          type: "arc-dash",
+        const projectileId =
+          typeof action.effectId === "string" && action.effectId ? action.effectId : uid("arc_orb_");
+        const launchFrom = {
+          x: actor.x + Math.cos(actor.aim) * 28,
+          y: actor.y + Math.sin(actor.aim) * 28,
+        };
+        const initialTarget = this.findClosestTargetInCone(
+          actor.x,
+          actor.y,
+          actor.aim,
+          ARC_ORB_TARGET_RANGE,
+          ARC_ORB_TARGET_ARC,
+          actor.id
+        );
+        const fallbackTarget = this.pointAlongAim(actor, 260);
+        this.authority.projectiles.set(projectileId, {
+          id: projectileId,
+          kind: "arc-orb",
           ownerId: actor.id,
           loadoutId: loadout.id,
-          fromX: origin.x,
-          fromY: origin.y,
-          toX: finalPose.x,
-          toY: finalPose.y,
-          chains: chains.map((target) => ({
-            id: target.id,
-            x: target.x,
-            y: target.y,
-          })),
-          color: loadout.theme,
+          x: launchFrom.x,
+          y: launchFrom.y,
+          targetId: initialTarget?.id || null,
+          targetX: initialTarget?.x || fallbackTarget.x,
+          targetY: initialTarget?.y || fallbackTarget.y,
+          radius: ARC_ORB_RADIUS,
+          damage: ARC_ORB_DAMAGE,
+          speed: ARC_ORB_SPEED,
+          acceleratedSpeed: ARC_ORB_ACCELERATED_SPEED,
+          ricochetsRemaining: ARC_ORB_BOUNCES,
+          lifetime: ARC_ORB_LIFETIME,
+          age: 0,
+          hitIds: [],
+          color: actorColor,
         });
-        chains.forEach((target) => {
-          this.applyDamage(target.id, 22, actor.id, "Arc Dash");
+        this.enqueueEvent({
+          type: "arc-orb-launch",
+          projectileId,
+          ownerId: actor.id,
+          loadoutId: loadout.id,
+          x: launchFrom.x,
+          y: launchFrom.y,
+          targetId: initialTarget?.id || null,
+          targetX: initialTarget?.x || fallbackTarget.x,
+          targetY: initialTarget?.y || fallbackTarget.y,
+          speed: ARC_ORB_SPEED,
+          color: actorColor,
         });
         break;
       }
       case "volt:E": {
-        const field = this.pointAlongAim(actor, 210);
-        const effectId = uid("gravity_");
+        const field =
+          Number.isFinite(action.targetX) && Number.isFinite(action.targetY)
+            ? {
+                x: clamp(action.targetX, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+                y: clamp(action.targetY, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+              }
+            : this.pointAlongAim(actor, 210);
+        const effectId =
+          typeof action.effectId === "string" && action.effectId ? action.effectId : uid("gravity_");
         this.authority.effects.set(uid("fx_"), {
           id: effectId,
           type: "gravity",
@@ -1061,28 +1975,39 @@ class PlayroomRoomService {
           radius: 172,
           expiresAt: now + 4600,
           pull: 360,
+          damage: VOLT_GRAVITY_DAMAGE,
           pulseEvery: 780,
           nextPulseAt: now + 120,
-          color: loadout.theme,
+          color: actorColor,
         });
         this.enqueueEvent({
           type: "gravity",
           effectId,
           ownerId: actor.id,
           loadoutId: loadout.id,
+          fromX: actor.x,
+          fromY: actor.y,
           x: field.x,
           y: field.y,
           radius: 172,
           expiresAt: now + 4600,
           pull: 360,
+          damage: VOLT_GRAVITY_DAMAGE,
           pulseEvery: 780,
-          color: loadout.theme,
+          color: actorColor,
         });
         break;
       }
       case "volt:R": {
-        const core = this.pointAlongAim(actor, 250);
-        const effectId = uid("storm_");
+        const core =
+          Number.isFinite(action.targetX) && Number.isFinite(action.targetY)
+            ? {
+                x: clamp(action.targetX, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+                y: clamp(action.targetY, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+              }
+            : this.pointAlongAim(actor, 250);
+        const effectId =
+          typeof action.effectId === "string" && action.effectId ? action.effectId : uid("storm_");
         this.authority.effects.set(uid("fx_"), {
           id: effectId,
           type: "storm",
@@ -1094,20 +2019,22 @@ class PlayroomRoomService {
           damage: 13,
           pulseEvery: 1000,
           nextPulseAt: now + 1000,
-          color: loadout.theme,
+          color: actorColor,
         });
         this.enqueueEvent({
           type: "storm",
           effectId,
           ownerId: actor.id,
           loadoutId: loadout.id,
+          fromX: actor.x,
+          fromY: actor.y,
           x: core.x,
           y: core.y,
           radius: 150,
           expiresAt: now + 5600,
           damage: 13,
           pulseEvery: 1000,
-          color: loadout.theme,
+          color: actorColor,
         });
         break;
       }
@@ -1123,10 +2050,14 @@ class PlayroomRoomService {
     };
   }
 
-  performDash(actor, distance, color) {
+  performDash(actor, distance, color, direction = null) {
+    const dashDirection =
+      direction && Math.hypot(direction.x || 0, direction.y || 0) > 0.01
+        ? normalize(direction.x, direction.y)
+        : { x: Math.cos(actor.aim), y: Math.sin(actor.aim) };
     const to = {
-      x: clamp(actor.x + Math.cos(actor.aim) * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
-      y: clamp(actor.y + Math.sin(actor.aim) * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+      x: clamp(actor.x + dashDirection.x * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+      y: clamp(actor.y + dashDirection.y * distance, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
     };
 
     this.setPoseState(actor.id, { x: to.x, y: to.y, aim: actor.aim }, false);
@@ -1145,14 +2076,111 @@ class PlayroomRoomService {
   }
 
   getTargetsInRadius(x, y, radius, excludeId = null) {
-    return this.getLiveRecords()
-      .filter((record) => record.alive !== false && record.id !== excludeId)
-      .map((record) => ({
+    const targets = [];
+    this.forEachTargetInRadius(x, y, radius, excludeId, (record, distance) => {
+      targets.push({
         ...clonePlayerRecord(record),
-        distance: Math.hypot(record.x - x, record.y - y),
-      }))
-      .filter((record) => record.distance <= radius)
-      .sort((left, right) => left.distance - right.distance);
+        distance,
+      });
+    });
+    return targets.sort((left, right) => left.distance - right.distance);
+  }
+
+  findClosestTargetInRadius(x, y, radius, excludeId = null) {
+    let closest = null;
+    let closestDistance = radius;
+
+    this.forEachTargetInRadius(x, y, radius, excludeId, (record, distance) => {
+      if (distance <= closestDistance) {
+        closest = record;
+        closestDistance = distance;
+      }
+    });
+
+    if (!closest) {
+      return null;
+    }
+
+    return {
+      ...clonePlayerRecord(closest),
+      distance: closestDistance,
+    };
+  }
+
+  findClosestTargetInRadiusFiltered(x, y, radius, excludeId = null, excludedIds = null) {
+    const excludedSet = excludedIds instanceof Set ? excludedIds : new Set(excludedIds || []);
+    let closest = null;
+    let closestDistance = radius;
+
+    this.forEachTargetInRadius(x, y, radius, excludeId, (record, distance) => {
+      if (excludedSet.has(record.id)) {
+        return;
+      }
+      if (distance <= closestDistance) {
+        closest = record;
+        closestDistance = distance;
+      }
+    });
+
+    if (!closest) {
+      return null;
+    }
+
+    return {
+      ...clonePlayerRecord(closest),
+      distance: closestDistance,
+    };
+  }
+
+  findClosestTargetInCone(x, y, angle, range, arc, excludeId = null, excludedIds = null) {
+    const excludedSet = excludedIds instanceof Set ? excludedIds : new Set(excludedIds || []);
+    let closest = null;
+    let closestDistance = range;
+
+    this.getLiveRecords().forEach((record) => {
+      if (record.alive === false || record.id === excludeId || excludedSet.has(record.id)) {
+        return;
+      }
+
+      const dx = record.x - x;
+      const dy = record.y - y;
+      const distance = Math.hypot(dx, dy);
+      if (distance > range) {
+        return;
+      }
+
+      const diff = Math.abs(wrapAngle(Math.atan2(dy, dx) - angle));
+      if (diff > arc) {
+        return;
+      }
+
+      if (distance <= closestDistance) {
+        closest = record;
+        closestDistance = distance;
+      }
+    });
+
+    if (!closest) {
+      return null;
+    }
+
+    return {
+      ...clonePlayerRecord(closest),
+      distance: closestDistance,
+    };
+  }
+
+  forEachTargetInRadius(x, y, radius, excludeId = null, callback) {
+    this.getLiveRecords().forEach((record) => {
+      if (record.alive === false || record.id === excludeId) {
+        return;
+      }
+
+      const distance = Math.hypot(record.x - x, record.y - y);
+      if (distance <= radius) {
+        callback(record, distance);
+      }
+    });
   }
 
   castRay(actor, angle, range, thickness, pierce, excludeId = null) {
@@ -1196,7 +2224,7 @@ class PlayroomRoomService {
   }
 
   radialDamage(x, y, radius, amount, ownerId, source) {
-    this.getTargetsInRadius(x, y, radius, ownerId).forEach((target) => {
+    this.forEachTargetInRadius(x, y, radius, ownerId, (target) => {
       this.applyDamage(target.id, amount, ownerId, source);
     });
   }
@@ -1262,7 +2290,13 @@ class PlayroomRoomService {
   applyDamage(targetId, amount, ownerId, source) {
     const now = Date.now();
     const target = this.getPlayerRecord(targetId);
-    if (!target || target.alive === false || amount <= 0) {
+    const owner =
+      typeof ownerId === "string" && ownerId !== "storm" ? this.getPlayerRecord(ownerId) : null;
+    const adjustedAmount =
+      this.matchState.practiceMode && owner?.isBot && !target?.isBot
+        ? Math.max(1, Math.round(amount * PRACTICE_ENEMY_DAMAGE_SCALE))
+        : amount;
+    if (!target || target.alive === false || adjustedAmount <= 0) {
       return;
     }
 
@@ -1270,16 +2304,28 @@ class PlayroomRoomService {
       return;
     }
 
-    let remaining = amount;
+    let remaining = adjustedAmount;
     const shieldDamage = Math.min(target.shield, remaining);
     const nextShield = Math.max(0, target.shield - shieldDamage);
     remaining -= shieldDamage;
     const nextHealth = Math.max(0, target.health - remaining);
     const nextAlive = nextHealth > 0;
+    const shieldBroken = target.shield > 0 && shieldDamage > 0 && nextShield <= 0;
     const nextEffects = {
       ...(target.effects || {}),
       revealedUntil: source === "Recon Beacon" ? now + 600 : target.effects?.revealedUntil,
     };
+
+    if (shieldBroken) {
+      this.enqueueEvent({
+        type: "shield-pop",
+        targetId,
+        x: target.x,
+        y: target.y,
+        radius: 76,
+        color: target.color || "#9ee4ff",
+      });
+    }
 
     this.setCombatState(targetId, {
       shield: nextShield,
@@ -1292,7 +2338,9 @@ class PlayroomRoomService {
       type: "damage",
       ownerId,
       targetId,
-      amount,
+      amount: adjustedAmount,
+      x: target.x,
+      y: target.y,
       source,
     });
 
@@ -1320,7 +2368,6 @@ class PlayroomRoomService {
       });
 
       if (ownerId && ownerId !== targetId) {
-        const owner = this.getPlayerRecord(ownerId);
         if (owner) {
           this.setCombatState(ownerId, {
             kills: (owner.kills || 0) + 1,
@@ -1368,6 +2415,7 @@ class PlayroomRoomService {
       .forEach((record) => {
         const profile = this.getProfileState(record.id);
         const loadout = getLoadout(profile.loadoutId);
+        const vitals = this.getConfiguredVitals(profile);
         const authority = this.ensureAuthorityPlayer(record.id);
         const spawn = this.findRespawnPoint(record.id, now);
 
@@ -1383,8 +2431,10 @@ class PlayroomRoomService {
         });
 
         this.setCombatState(record.id, {
-          health: loadout.maxHealth,
-          shield: loadout.maxShield,
+          health: vitals.maxHealth,
+          shield: vitals.maxShield,
+          maxHealth: vitals.maxHealth,
+          maxShield: vitals.maxShield,
           alive: true,
           respawnAt: 0,
           respawns: (record.respawns || 0) + 1,
@@ -1404,7 +2454,7 @@ class PlayroomRoomService {
           loadoutId: loadout.id,
           x: spawn.x,
           y: spawn.y,
-          color: loadout.theme,
+          color: record.color || loadout.theme,
         });
       });
   }
@@ -1416,6 +2466,7 @@ class PlayroomRoomService {
 
     const now = Date.now();
     this.matchState = sanitizeMatchState(this.playroom.getState(MATCH_KEY));
+    this.moderationState = this.getModerationState();
 
     if (this.matchState.hostId !== this.localPlayer.id) {
       this.matchState.hostId = this.localPlayer.id;
@@ -1428,7 +2479,10 @@ class PlayroomRoomService {
       }
     });
 
+    this.assignRoomPlayerSlots();
+
     if (this.matchState.state === "running") {
+      this.updatePracticeBots(now);
       this.simulateProjectiles(now);
       this.simulateEffects(now);
       this.applyStormDamage(now);
@@ -1445,6 +2499,11 @@ class PlayroomRoomService {
 
   simulateProjectiles(now) {
     this.authority.projectiles.forEach((projectile, projectileId) => {
+      if (projectile.kind === "arc-orb") {
+        this.simulateArcOrbProjectile(projectile, projectileId, now);
+        return;
+      }
+
       projectile.lastUpdatedAt = projectile.lastUpdatedAt || now;
       const delta = (now - projectile.lastUpdatedAt) / 1000;
       projectile.lastUpdatedAt = now;
@@ -1452,14 +2511,24 @@ class PlayroomRoomService {
       projectile.x += projectile.vx * delta;
       projectile.y += projectile.vy * delta;
 
-      const hit = this.getTargetsInRadius(
+      const hit = this.findClosestTargetInRadius(
         projectile.x,
         projectile.y,
         projectile.radius + PLAYER_RADIUS,
         projectile.ownerId
-      )[0];
+      );
 
       if (hit) {
+        this.enqueueEvent({
+          type: "projectile-impact",
+          projectileId,
+          ownerId: projectile.ownerId,
+          loadoutId: projectile.loadoutId,
+          x: projectile.x,
+          y: projectile.y,
+          radius: projectile.explosionRadius || projectile.radius * 4,
+          color: projectile.color,
+        });
         if (projectile.explosionRadius) {
           this.radialDamage(
             projectile.x,
@@ -1489,6 +2558,16 @@ class PlayroomRoomService {
       }
 
       if (projectile.explosionRadius) {
+        this.enqueueEvent({
+          type: "projectile-impact",
+          projectileId,
+          ownerId: projectile.ownerId,
+          loadoutId: projectile.loadoutId,
+          x: projectile.x,
+          y: projectile.y,
+          radius: projectile.explosionRadius,
+          color: projectile.color,
+        });
         this.radialDamage(
           projectile.x,
           projectile.y,
@@ -1503,6 +2582,130 @@ class PlayroomRoomService {
     });
   }
 
+  simulateArcOrbProjectile(projectile, projectileId, now) {
+    projectile.lastUpdatedAt = projectile.lastUpdatedAt || now;
+    const delta = Math.min(0.08, (now - projectile.lastUpdatedAt) / 1000);
+    projectile.lastUpdatedAt = now;
+    projectile.age += delta;
+
+    if (projectile.age >= projectile.lifetime) {
+      this.enqueueEvent({
+        type: "arc-orb-end",
+        projectileId,
+        ownerId: projectile.ownerId,
+        x: projectile.x,
+        y: projectile.y,
+        color: projectile.color,
+      });
+      this.authority.projectiles.delete(projectileId);
+      return;
+    }
+
+    const excludedIds = new Set(projectile.hitIds || []);
+    let target =
+      projectile.targetId && !excludedIds.has(projectile.targetId)
+        ? this.getPlayerRecord(projectile.targetId)
+        : null;
+    if (!target || target.alive === false || target.id === projectile.ownerId) {
+      target = this.findClosestTargetInRadiusFiltered(
+        projectile.x,
+        projectile.y,
+        ARC_ORB_BOUNCE_RADIUS,
+        projectile.ownerId,
+        excludedIds
+      );
+      projectile.targetId = target?.id || null;
+    }
+
+    if (target) {
+      projectile.targetX = target.x;
+      projectile.targetY = target.y;
+    }
+
+    const destinationX = projectile.targetX ?? projectile.x;
+    const destinationY = projectile.targetY ?? projectile.y;
+    const dx = destinationX - projectile.x;
+    const dy = destinationY - projectile.y;
+    const distance = Math.hypot(dx, dy);
+    const step = projectile.speed * delta;
+
+    if (distance <= Math.max(projectile.radius + PLAYER_RADIUS, step + 2)) {
+      projectile.x = destinationX;
+      projectile.y = destinationY;
+
+      if (target) {
+        excludedIds.add(target.id);
+        projectile.hitIds = Array.from(excludedIds);
+        this.applyDamage(target.id, projectile.damage, projectile.ownerId, "Arc Orb");
+
+        const nextTarget =
+          projectile.ricochetsRemaining > 0
+            ? this.findClosestTargetInRadiusFiltered(
+                target.x,
+                target.y,
+                ARC_ORB_BOUNCE_RADIUS,
+                projectile.ownerId,
+                excludedIds
+              )
+            : null;
+
+        if (nextTarget) {
+          projectile.ricochetsRemaining -= 1;
+          projectile.speed = projectile.acceleratedSpeed || ARC_ORB_ACCELERATED_SPEED;
+          projectile.targetId = nextTarget.id;
+          projectile.targetX = nextTarget.x;
+          projectile.targetY = nextTarget.y;
+          this.enqueueEvent({
+            type: "arc-orb-hop",
+            projectileId,
+            ownerId: projectile.ownerId,
+            fromX: target.x,
+            fromY: target.y,
+            toX: nextTarget.x,
+            toY: nextTarget.y,
+            targetId: nextTarget.id,
+            speed: projectile.speed,
+            color: projectile.color,
+          });
+          return;
+        }
+      }
+
+      this.enqueueEvent({
+        type: "arc-orb-end",
+        projectileId,
+        ownerId: projectile.ownerId,
+        x: projectile.x,
+        y: projectile.y,
+        color: projectile.color,
+      });
+      this.authority.projectiles.delete(projectileId);
+      return;
+    }
+
+    if (distance > 0.001) {
+      projectile.x += (dx / distance) * step;
+      projectile.y += (dy / distance) * step;
+    }
+
+    if (
+      projectile.x < PLAYER_RADIUS ||
+      projectile.y < PLAYER_RADIUS ||
+      projectile.x > WORLD_SIZE - PLAYER_RADIUS ||
+      projectile.y > WORLD_SIZE - PLAYER_RADIUS
+    ) {
+      this.enqueueEvent({
+        type: "arc-orb-end",
+        projectileId,
+        ownerId: projectile.ownerId,
+        x: projectile.x,
+        y: projectile.y,
+        color: projectile.color,
+      });
+      this.authority.projectiles.delete(projectileId);
+    }
+  }
+
   simulateEffects(now) {
     this.authority.effects.forEach((effect, effectId) => {
       if ((effect.expiresAt || 0) <= now) {
@@ -1511,8 +2714,13 @@ class PlayroomRoomService {
       }
 
       if (effect.type === "mine" && now >= effect.armedAt) {
-        const victims = this.getTargetsInRadius(effect.x, effect.y, effect.radius, effect.ownerId);
-        if (victims.length) {
+        const triggerVictim = this.findClosestTargetInRadius(
+          effect.x,
+          effect.y,
+          effect.triggerRadius || effect.radius,
+          effect.ownerId
+        );
+        if (triggerVictim) {
           this.enqueueEvent({
             type: "mine-detonate",
             effectId: effect.id,
@@ -1520,10 +2728,11 @@ class PlayroomRoomService {
             x: effect.x,
             y: effect.y,
             radius: effect.radius,
+            triggerRadius: effect.triggerRadius || null,
             color: effect.color,
           });
-          victims.forEach((target) => {
-            this.applyTimedEffect(target.id, "slowedUntil", now + MINE_SLOW_DURATION_MS);
+          this.applyTimedEffect(triggerVictim.id, "slowedUntil", now + MINE_SLOW_DURATION_MS);
+          this.forEachTargetInRadius(effect.x, effect.y, effect.radius, effect.ownerId, (target) => {
             this.applyDamage(target.id, effect.damage, effect.ownerId, "Pulse Mine");
           });
           this.authority.effects.delete(effectId);
@@ -1542,15 +2751,15 @@ class PlayroomRoomService {
           radius: effect.radius,
           color: effect.color,
         });
-        this.getTargetsInRadius(effect.x, effect.y, effect.radius, effect.ownerId).forEach((target) => {
+        this.forEachTargetInRadius(effect.x, effect.y, effect.radius, effect.ownerId, (target) => {
           this.applyDamage(target.id, effect.damage, effect.ownerId, "Storm Core");
         });
         return;
       }
 
       if (effect.type === "gravity") {
-        this.getTargetsInRadius(effect.x, effect.y, effect.radius, effect.ownerId).forEach((target) => {
-          const falloff = clamp(1 - target.distance / Math.max(effect.radius, 1), 0.28, 1);
+        this.forEachTargetInRadius(effect.x, effect.y, effect.radius, effect.ownerId, (target, distance) => {
+          const falloff = clamp(1 - distance / Math.max(effect.radius, 1), 0.28, 1);
           this.pullTargetTowardPoint(
             target.id,
             effect.x,
@@ -1570,6 +2779,9 @@ class PlayroomRoomService {
             radius: effect.radius,
             color: effect.color,
           });
+          this.forEachTargetInRadius(effect.x, effect.y, effect.radius, effect.ownerId, (target) => {
+            this.applyDamage(target.id, effect.damage || VOLT_GRAVITY_DAMAGE, effect.ownerId, "Gravity Well");
+          });
         }
         return;
       }
@@ -1587,7 +2799,7 @@ class PlayroomRoomService {
             color: effect.color,
           });
         }
-        this.getTargetsInRadius(effect.x, effect.y, effect.radius, effect.ownerId).forEach((target) => {
+        this.forEachTargetInRadius(effect.x, effect.y, effect.radius, effect.ownerId, (target) => {
           this.applyTimedEffect(target.id, "revealedUntil", now + RECON_REVEAL_DURATION_MS);
         });
       }
@@ -1639,6 +2851,165 @@ class PlayroomRoomService {
     this.matchState.revision += 1;
     this.pendingMatchSync = true;
   }
+
+  updatePracticeBots(now) {
+    const targets = this.getHumanRecords(now);
+    if (!targets.length) {
+      return;
+    }
+
+    const storm =
+      this.matchState.startedAt && this.matchState.seed
+        ? getStormState(this.matchState.startedAt, this.matchState.seed, now)
+        : null;
+    const mineAttractors = Array.from(this.authority.effects.values()).filter(
+      (effect) => effect?.type === "mine" && (effect.expiresAt || 0) > now
+    );
+
+    this.getLiveRecords()
+      .filter((record) => record.isBot && record.alive !== false)
+      .forEach((bot) => {
+        const authority = this.ensureAuthorityPlayer(bot.id);
+        const loadout = getLoadout(bot.loadoutId);
+        const target = targets
+          .map((candidate) => ({
+            ...candidate,
+            distance: Math.hypot(candidate.x - bot.x, candidate.y - bot.y),
+          }))
+          .sort((left, right) => left.distance - right.distance)[0];
+
+        if (!target) {
+          return;
+        }
+
+        const angleToTarget = Math.atan2(target.y - bot.y, target.x - bot.x);
+
+        if (now >= (authority.botNextDecisionAt || 0)) {
+          authority.botNextDecisionAt =
+            now + BOT_DECISION_MIN_MS + Math.random() * BOT_DECISION_JITTER_MS;
+          authority.botStrafeDirection = Math.random() < 0.5 ? -1 : 1;
+          authority.botPreferredRange =
+            (BOT_PREFERRED_RANGE[loadout.id] || 340) * (0.9 + Math.random() * 0.26);
+          authority.botWanderAngle =
+            angleToTarget + authority.botStrafeDirection * (0.62 + Math.random() * 0.44);
+          if (now >= (authority.botPauseUntil || 0)) {
+            scheduleBotFireWindow(authority, now);
+          }
+        }
+
+        if (now >= (authority.botPauseUntil || 0) && now > (authority.botBurstUntil || 0)) {
+          scheduleBotFireWindow(authority, now);
+        }
+
+        const preferredRange = authority.botPreferredRange || BOT_PREFERRED_RANGE[loadout.id] || 340;
+        const retreatPad = loadout.id === "ember" ? 30 : 55;
+        const chasePad = loadout.id === "phantom" ? 110 : 80;
+        const toTarget = normalize(target.x - bot.x, target.y - bot.y);
+        const strafe = {
+          x: -toTarget.y * authority.botStrafeDirection,
+          y: toTarget.x * authority.botStrafeDirection,
+        };
+        const nearestMine = mineAttractors
+          .filter((effect) => effect.ownerId !== bot.id)
+          .map((effect) => ({
+            effect,
+            distance: Math.hypot(effect.x - bot.x, effect.y - bot.y),
+          }))
+          .filter((entry) => entry.distance <= BOT_MINE_ATTRACTION_RADIUS)
+          .sort((left, right) => left.distance - right.distance)[0];
+
+        let moveX = strafe.x * 0.74;
+        let moveY = strafe.y * 0.74;
+
+        if (target.distance > preferredRange + chasePad) {
+          moveX += toTarget.x * 1.28;
+          moveY += toTarget.y * 1.28;
+        } else if (target.distance < preferredRange - retreatPad) {
+          moveX -= toTarget.x * 1.06;
+          moveY -= toTarget.y * 1.06;
+        } else {
+          moveX += toTarget.x * 0.24;
+          moveY += toTarget.y * 0.24;
+        }
+
+        if (authority.botWanderAngle) {
+          moveX += Math.cos(authority.botWanderAngle) * 0.42;
+          moveY += Math.sin(authority.botWanderAngle) * 0.42;
+        }
+
+        if (nearestMine) {
+          const toMine = normalize(nearestMine.effect.x - bot.x, nearestMine.effect.y - bot.y);
+          const minePull =
+            0.72 +
+            clamp(
+              (BOT_MINE_ATTRACTION_RADIUS - nearestMine.distance) / BOT_MINE_ATTRACTION_RADIUS,
+              0,
+              0.9
+            );
+          moveX += toMine.x * minePull;
+          moveY += toMine.y * minePull;
+        }
+
+        if (storm) {
+          const distanceToCenter = Math.hypot(bot.x - storm.center.x, bot.y - storm.center.y);
+          const safeRadius = Math.max(180, storm.radius - BOT_STORM_BUFFER);
+          const toCenter = normalize(storm.center.x - bot.x, storm.center.y - bot.y);
+
+          if (distanceToCenter > safeRadius) {
+            const urgency = 1.24 + clamp((distanceToCenter - safeRadius) / 180, 0, 1.4);
+            moveX += toCenter.x * urgency * 1.34;
+            moveY += toCenter.y * urgency * 1.34;
+          } else if (distanceToCenter > safeRadius * 0.82) {
+            moveX += toCenter.x * 0.52;
+            moveY += toCenter.y * 0.52;
+          }
+        }
+
+        const movement = normalize(moveX, moveY);
+        const step = this.getActorMoveSpeed(bot, now) * 0.84 * (HOST_TICK_MS / 1000);
+        const aimOffset =
+          loadout.id === "ember"
+            ? (Math.random() - 0.5) * 0.14
+            : loadout.id === "phantom"
+              ? (Math.random() - 0.5) * 0.04
+              : (Math.random() - 0.5) * 0.08;
+        const reliablePose = now >= (authority.botReliablePoseAt || 0);
+        if (reliablePose) {
+          authority.botReliablePoseAt = now + BOT_POSE_RELIABLE_INTERVAL_MS;
+        }
+        const nextPose = this.setPoseState(
+          bot.id,
+          {
+            x: clamp(bot.x + movement.x * step, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            y: clamp(bot.y + movement.y * step, PLAYER_RADIUS, WORLD_SIZE - PLAYER_RADIUS),
+            aim: wrapAngle(angleToTarget + aimOffset),
+          },
+          reliablePose
+        );
+
+        const botActor = {
+          ...bot,
+          x: nextPose?.x ?? bot.x,
+          y: nextPose?.y ?? bot.y,
+          aim: nextPose?.aim ?? angleToTarget,
+        };
+        const aimError = Math.abs(wrapAngle(angleToTarget - botActor.aim));
+        const range = this.getPrimaryRange(loadout);
+        const firingWindowOpen = now <= (authority.botBurstUntil || 0);
+        const shouldFire =
+          firingWindowOpen &&
+          target.distance <= range * 0.92 &&
+          aimError <= 0.24 &&
+          (target.distance <= preferredRange + 170 || target.distance <= range * 0.68);
+
+        if (shouldFire) {
+          this.processPrimaryAction(botActor, authority, {
+            kind: "primary",
+            createdAt: now,
+          });
+        }
+      });
+  }
 }
 
 class MissingConfigService {
@@ -1648,6 +3019,7 @@ class MissingConfigService {
     this.snapshot = {
       roomId: "",
       meta: emptyMatchState(),
+      moderation: emptyModerationState(),
       players: {},
       events: [],
       localPlayerId: null,
@@ -1680,6 +3052,26 @@ class MissingConfigService {
 
   async startMatch() {
     throw new Error("Configure o Playroom para iniciar a partida online.");
+  }
+
+  async startSoloPractice() {
+    throw new Error("Configure o Playroom para iniciar a sala solo.");
+  }
+
+  async endMatch() {
+    throw new Error("Configure o Playroom para encerrar a partida.");
+  }
+
+  async transferLeadership() {
+    throw new Error("Configure o Playroom para transferir a lideranca.");
+  }
+
+  async kickPlayer() {
+    throw new Error("Configure o Playroom para expulsar jogadores.");
+  }
+
+  async banPlayer() {
+    throw new Error("Configure o Playroom para banir jogadores.");
   }
 
   async leaveRoom() {}
